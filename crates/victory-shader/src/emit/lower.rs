@@ -7168,8 +7168,8 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let table = self.s.stride_table_handle();
         // A root view has no bounds: a wild index would read past the table.
-        let slot = if super::limits_indices() || from != 0 {
-            let (i32t, last) = (self.s.t.i32, self.s.m.i32(super::OWN_SLOTS - 1));
+        let slot = if super::limits_indices() || from != 0 || super::view_heap_limit() != 0 {
+            let (i32t, last) = (self.s.t.i32, self.s.m.i32(super::shader::last_view_index()));
             self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last])
         } else {
             slot

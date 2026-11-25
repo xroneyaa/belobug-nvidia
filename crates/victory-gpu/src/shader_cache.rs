@@ -80,6 +80,8 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container for a host that runs
 /// `target`'s wave sizes, from the cache when there is one.
 pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader, String> {
+    // The view heap limit is part of the translation: known before it.
+    crate::descriptor::host::probe_view_limit();
     let translate =
         |c: &[u8]| victory_shader::emit::translate_for(c, target).map_err(|e| e.to_string());
     match CACHE.get() {
@@ -106,6 +108,8 @@ fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(build);
     h.update(&target.key());
+    // Translations clamp view indices to a capped host heap's null slot.
+    h.update(&victory_shader::emit::view_heap_limit().to_le_bytes());
     *h.finalize().as_bytes()
 }
 

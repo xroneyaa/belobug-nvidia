@@ -16,6 +16,56 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// (one `u32` element stride per view-heap slot).
 pub const STRIDE_SPACE: u32 = 2;
 
+/// The null slot a host view heap keeps at its end when the title's heap
+/// did not fit in it (0: no limit). Shaders translated while it is set
+/// read that slot for any view index at or past it: a host that caps its
+/// view heap (NVIDIA at 1,000,000 views; the title's heap is larger) hangs
+/// its GPU on reads past the end, which AMD's driver forgives.
+static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view
+/// heap, kept null.
+pub fn set_view_heap_limit(null_slot: u32) {
+    VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The view heap's null slot set by [`set_view_heap_limit`] (0: none). A
+/// translation depends on it, so shader caches must key on it.
+pub fn view_heap_limit() -> u32 {
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The last view index a shader may reach: below [`super::OWN_SLOTS`],
+/// and no further than the host heap's null slot when it is capped.
+pub(crate) fn last_view_index() -> u32 {
+    last_view_for(view_heap_limit())
+}
+
+/// [`last_view_index`] for a heap null slot `limit` (0: none). Pure.
+fn last_view_for(limit: u32) -> u32 {
+    match limit {
+        0 => super::OWN_SLOTS - 1,
+        limit => limit.min(super::OWN_SLOTS - 1),
+    }
+}
+
+#[cfg(test)]
+mod view_limit_tests {
+    use super::last_view_for;
+    use crate::emit::OWN_SLOTS;
+
+    #[test]
+    fn uncapped_heap_keeps_own_slots() {
+        assert_eq!(last_view_for(0), OWN_SLOTS - 1);
+    }
+
+    #[test]
+    fn capped_heap_stops_at_its_null_slot() {
+        assert_eq!(last_view_for(999_999), 999_999);
+        assert_eq!(last_view_for(u32::MAX), OWN_SLOTS - 1);
+    }
+}
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
@@ -403,9 +453,10 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
-        // An index past the heap is a fault that stops the host GPU.
-        let index = if !sampler && super::limits_indices() {
-            let last = self.m.i32(super::OWN_SLOTS - 1);
+        // An index past the heap is a fault that stops the host GPU (on a
+        // capped host heap, past its null slot: `set_view_heap_limit`).
+        let index = if !sampler && (super::limits_indices() || view_heap_limit() != 0) {
+            let last = self.m.i32(last_view_index());
             let i32t = self.t.i32;
             self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last])
         } else {

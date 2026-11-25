@@ -512,8 +512,45 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// is the title's 1,245,184 slots, these and those of [`crate::memory`].
 const DYNAMIC: u32 = 1 << 20;
 /// Smaller dynamic reserve when the host caps the whole view heap at
-/// [`PORTABLE_VIEWS`].
-const DYNAMIC_CAPPED: u32 = 1 << 16;
+/// [`PORTABLE_VIEWS`]. 2^16 ran out in heavy frames on NVIDIA (draws
+/// dropped, slow searches for free slots); 2^18 held.
+/// `VICTORY_CAPPED_DYNAMIC` (slots, 2^16..2^19) overrides it.
+const DYNAMIC_CAPPED: u32 = 1 << 18;
+
+/// [`DYNAMIC_CAPPED`], or `VICTORY_CAPPED_DYNAMIC` when set.
+fn dynamic_capped() -> u32 {
+    std::env::var("VICTORY_CAPPED_DYNAMIC")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map_or(DYNAMIC_CAPPED, |n| n.clamp(1 << 16, 1 << 19))
+}
+
+/// Whether the host caps shader-visible view heaps at [`PORTABLE_VIEWS`]
+/// (NVIDIA), and if so tells the translator (`set_view_heap_limit`) before
+/// the first shader is translated: shaders translated before the view heap
+/// is made would otherwise read view indices past it unclamped, the read
+/// that hangs NVIDIA's GPU. Called before every translation; runs once.
+pub(crate) fn probe_view_limit() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Some(host) = host() else { return };
+        // SAFETY: plain heap creation; the heap is released at once.
+        let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: PORTABLE_VIEWS + 1,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+        };
+        if made.is_err() {
+            tracing::info!(
+                "the host caps view heaps at {PORTABLE_VIEWS}: view indices are clamped to its null slot"
+            );
+            victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+        }
+    });
+}
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
@@ -585,18 +622,21 @@ impl HostHeap {
             Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
                 // draw::tables now remaps the root tables that reach them.
+                // The heap's last slot stays null: shaders read it for any
+                // view index from there on (`set_view_heap_limit`), as a
+                // read past the end hangs NVIDIA's GPU.
+                let dynamic = dynamic_capped();
+                let kept = PORTABLE_VIEWS - dynamic - crate::memory::SLOTS - 1;
                 tracing::warn!(
                     error = %e,
                     wanted,
-                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
+                    made = kept,
+                    dynamic,
+                    lost = wanted.saturating_sub(kept),
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
-                (
-                    make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
-                    DYNAMIC_CAPPED,
-                )
+                victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+                (make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?, kept, dynamic)
             }
             Err(e) => {
                 tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -635,7 +675,11 @@ impl HostHeap {
         let strides = if sampler {
             None
         } else {
-            StrideTable::new(&host.device, count + extra)
+            // Shaders read it for any slot up to the heap's last (its null
+            // slot when capped), memory slots included.
+            // SAFETY: a plain call on a live heap.
+            let total = unsafe { heap.GetDesc() }.NumDescriptors;
+            StrideTable::new(&host.device, (count + extra).max(total))
         };
         let h = HostHeap {
             heap,
