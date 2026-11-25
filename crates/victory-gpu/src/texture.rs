@@ -746,6 +746,7 @@ mod tests {
         let copy = Arc::new(HostTexture {
             slot: None,
             skip: 0,
+            streamed: false,
             written: Default::default(),
             twin: Default::default(),
             shared_cast: false,

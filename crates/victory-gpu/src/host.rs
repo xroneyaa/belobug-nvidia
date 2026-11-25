@@ -897,7 +897,7 @@ const SCRATCH_CHUNK: u64 = 512 << 10;
 /// has hundreds of lists.
 static SCRATCH_FREE: Mutex<Vec<(ID3D12Resource, usize, u64)>> = Mutex::new(Vec::new());
 /// Free chunks kept; more are released.
-const SCRATCH_KEPT: usize = 256;
+const SCRATCH_KEPT: usize = 64;
 
 impl Scratch {
     fn give_back(&mut self) {
