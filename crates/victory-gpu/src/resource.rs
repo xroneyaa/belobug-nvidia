@@ -853,6 +853,22 @@ pub(crate) struct HostTexture {
     /// Planes shaders write as images, for depth textures the title also
     /// writes so ([`crate::twin`]); made on the first such view.
     pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
+    /// Whether this resource was created with working R9G9B9E5 casts.
+    pub(crate) shared_cast: bool,
+    /// Read-only reinterpret copy when the host cannot cast R32 to R9G9B9E5.
+    pub(crate) shared_copy: std::sync::OnceLock<Option<SharedExponentCopy>>,
+}
+
+/// Bit-preserving R9G9B9E5 copy of a written 32-bit texture together with its
+/// staging-free DEFAULT bridge buffer and subresource footprints.
+#[cfg(windows)]
+pub(crate) struct SharedExponentCopy {
+    pub(crate) texture: std::sync::Arc<HostTexture>,
+    pub(crate) buffer: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    pub(crate) parts: Vec<(
+        windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    )>,
 }
 
 /// Textures the host GPU writes, by the title memory they are placed in.
@@ -947,6 +963,15 @@ fn castable(
     static DEVICE: std::sync::OnceLock<Option<ID3D12Device10>> = std::sync::OnceLock::new();
     let device = DEVICE
         .get_or_init(|| {
+            // This Windows/NVIDIA runtime accepts the castable resource,
+            // but the R9G9B9E5 SRV removes its device. Do not trust only
+            // OPTIONS12 here; use the bit-preserving GPU copy fallback.
+            // D3D12 devices are per-adapter singletons, so an attempted
+            // view on another device in this process is not a safe probe.
+            if !shared_cast_allowed(device) {
+                tracing::info!("using GPU reinterpret copies for R32 to R9G9B9E5 views");
+                return None;
+            }
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
             // SAFETY: a structure of the size the feature has.
             unsafe {
@@ -962,7 +987,13 @@ fn castable(
                 tracing::warn!("the host cannot read 32-bit textures as shared-exponent colors");
                 return None;
             }
-            device.cast().ok()
+            match device.cast::<ID3D12Device10>() {
+                Ok(new) => Some(new),
+                Err(e) => {
+                    tracing::warn!(error = %e, "shared-exponent casting needs ID3D12Device10");
+                    None
+                }
+            }
         })
         .as_ref()?;
     let desc = D3D12_RESOURCE_DESC1 {
@@ -1004,6 +1035,177 @@ fn castable(
     }
     .ok()?;
     texture
+}
+
+/// NVIDIA rejected this cross-family view despite OPTIONS12 and resource
+/// creation succeeding. Keep the existing cast path only on other adapters.
+#[cfg(windows)]
+fn shared_cast_allowed(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) -> bool {
+    use windows::Win32::Graphics::Dxgi::*;
+    let query = || -> windows::core::Result<bool> {
+        // SAFETY: plain queries on the device's own adapter.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(device.GetAdapterLuid())?;
+            Ok(adapter.GetDesc1()?.VendorId != 0x10de)
+        }
+    };
+    query().unwrap_or(false)
+}
+
+/// The shared-exponent read-only view of a written 32-bit texture. Copies via
+/// a device-local buffer and `CopyTextureRegion` keep exact bit patterns across
+/// typeless format families where direct view casting removes the device.
+#[cfg(windows)]
+pub(crate) fn shared_exponent<'a>(this: This) -> Option<&'a SharedExponentCopy> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    if this.is_null() {
+        return None;
+    }
+    let copy = resource(this).host.as_ref()?;
+    // SAFETY: live texture.
+    let d = unsafe { copy.texture.GetDesc() };
+    if copy.shared_cast
+        || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+        || d.SampleDesc.Count > 1
+        || !matches!(
+            d.Format,
+            DXGI_FORMAT_R32_TYPELESS
+                | DXGI_FORMAT_R32_FLOAT
+                | DXGI_FORMAT_R32_UINT
+                | DXGI_FORMAT_R32_SINT
+        )
+    {
+        return None;
+    }
+    copy.shared_copy
+        .get_or_init(|| {
+            let host = crate::host::host()?;
+            let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                1
+            } else {
+                u32::from(d.DepthOrArraySize)
+            };
+            let parts = u32::from(d.MipLevels) * layers;
+            if parts == 0 || parts > 512 {
+                tracing::warn!(parts, "shared-exponent copy skipped: unsupported subresource count");
+                return None;
+            }
+            let target_desc = D3D12_RESOURCE_DESC {
+                Format: DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+                Alignment: 0,
+                ..d
+            };
+            let mut from_rows =
+                vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize];
+            let mut to_rows =
+                vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize];
+            let (mut from_bytes, mut to_bytes) = (0u64, 0u64);
+            // SAFETY: plain footprint queries; output buffers hold `parts` entries each.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &d,
+                    0,
+                    parts,
+                    0,
+                    Some(from_rows.as_mut_ptr()),
+                    None,
+                    None,
+                    Some(&mut from_bytes),
+                );
+                host.device.GetCopyableFootprints(
+                    &target_desc,
+                    0,
+                    parts,
+                    0,
+                    Some(to_rows.as_mut_ptr()),
+                    None,
+                    None,
+                    Some(&mut to_bytes),
+                );
+            }
+            let alike = from_rows.iter().zip(&to_rows).all(|(a, b)| {
+                let (fa, fb) = (a.Footprint, b.Footprint);
+                (a.Offset, fa.Width, fa.Height, fa.Depth, fa.RowPitch)
+                    == (b.Offset, fb.Width, fb.Height, fb.Depth, fb.RowPitch)
+            });
+            if from_bytes == 0 || from_bytes != to_bytes || !alike {
+                tracing::warn!(
+                    from_bytes,
+                    to_bytes,
+                    alike,
+                    "shared-exponent copy skipped: footprint mismatch"
+                );
+                return None;
+            }
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: same dimensions, a shader-readable copy with its own allocation.
+            let made = unsafe {
+                host.device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &target_desc,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                        | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    None,
+                    &mut texture,
+                )
+            };
+            if let Err(e) = made {
+                tracing::warn!(error = %e, "shared-exponent copy not made");
+                return None;
+            }
+            let texture = texture?;
+            let buffer = host.uav_buffer(from_bytes)?;
+            crate::host::name(&texture, || {
+                format!(
+                    "shared-exponent {}x{}x{} mips {}",
+                    d.Width, d.Height, d.DepthOrArraySize, d.MipLevels
+                )
+            });
+            crate::host::name(&buffer, || {
+                format!("shared-exponent bridge {from_bytes}B")
+            });
+            let bytes = allocation_bytes(&texture);
+            crate::memstat::add(&crate::memstat::HOST_TEXTURES, bytes);
+            crate::memstat::add(&crate::memstat::HOST_TEXTURE_COUNT, 1);
+            #[cfg(feature = "diagnostics")]
+            census(&texture, bytes as i64);
+            Some(SharedExponentCopy {
+                texture: std::sync::Arc::new(HostTexture {
+                    texture,
+                    state: std::sync::atomic::AtomicU32::new(0xc0),
+                    bytes,
+                    slot: None,
+                    skip: 0,
+                    written: Default::default(),
+                    twin: Default::default(),
+                    shared_cast: false,
+                    shared_copy: Default::default(),
+                }),
+                buffer,
+                parts: from_rows.into_iter().zip(to_rows).collect(),
+            })
+        })
+        .as_ref()
+}
+
+#[cfg(windows)]
+pub(crate) fn has_shared_cast(this: This) -> bool {
+    !this.is_null() && resource(this).host.as_ref().is_some_and(|h| h.shared_cast)
+}
+
+#[cfg(windows)]
+pub(crate) fn shared_exponent_made<'a>(this: This) -> Option<&'a SharedExponentCopy> {
+    if this.is_null() {
+        return None;
+    }
+    resource(this).host.as_ref()?.shared_copy.get()?.as_ref()
 }
 
 #[cfg(windows)]
@@ -1430,6 +1632,8 @@ fn hand_out_resource(
                 skip,
                 written: Default::default(),
                 twin: Default::default(),
+                shared_cast: common,
+                shared_copy: Default::default(),
                 state: state.into(),
             })
         }),

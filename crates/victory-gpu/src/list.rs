@@ -486,11 +486,11 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct Barrier {
-    kind: u32,
-    flags: u32,
-    first: This,
-    second: u64,
-    last: u64,
+    pub(crate) kind: u32,
+    pub(crate) flags: u32,
+    pub(crate) first: This,
+    pub(crate) second: u64,
+    pub(crate) last: u64,
 }
 
 /// The barrier on host resources, or `None` if it names a resource the host
@@ -586,6 +586,15 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
         }
+        for b in barriers {
+            const BEGIN_ONLY: u32 = 1;
+            if b.kind == 0 && b.flags & BEGIN_ONLY == 0 && !b.first.is_null() {
+                let wanted = crate::host::texture_state(b.last as u32);
+                if wanted & 0xc0 != 0 {
+                    list.prepare_shared_exponent(b.first, wanted);
+                }
+            }
+        }
     }
     0
 }
@@ -596,6 +605,9 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if !resource.is_null() {
         crate::resource::note_written(resource, state);
+        if state & 0xc0 != 0 {
+            list.prepare_shared_exponent(resource, state);
+        }
     }
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);

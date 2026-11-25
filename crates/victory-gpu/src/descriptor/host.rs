@@ -2432,7 +2432,7 @@ fn buffer_uav(
 /// family takes the texture's format.
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
-fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool, shared_cast: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
@@ -2470,7 +2470,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         && family(own) == 39
         && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
     {
-        return !unordered;
+        return !unordered && shared_cast;
     }
     // A packed 16-bit target made R8G8B8A8_UNORM on this GPU
     // (`resource::target_format`): views name the format it has.
@@ -2560,7 +2560,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
                 let mut desc = desc.as_ref().map(srv_desc);
-                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                let texture = if desc.as_ref().is_some_and(|d| d.Format.0 as u32 == crate::resource::SHARED_EXPONENT) {
+                    crate::resource::shared_exponent(resource).map_or(texture, |h| &h.texture.texture)
+                } else {
+                    texture
+                };
+                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false, crate::resource::has_shared_cast(resource)) {
                     return None;
                 }
                 let skip = crate::resource::skipped_mips(resource);
@@ -2600,7 +2605,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 return crate::twin::view(twin, desc.as_ref(), at).map(Some);
             }
             let mut desc = desc.as_ref().map(uav_desc);
-            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true, false) {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
@@ -2893,6 +2898,99 @@ mod tests {
         0x4059,
         [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
     );
+
+    /// The shared-exponent SRV uses a real R9G9B9E5 texture on hosts that
+    /// reject cross-family view casts, not an invalid view of R32_UINT.
+    #[test]
+    fn shared_exponent_view_keeps_the_device_alive() {
+        let Some(host) = host() else { return };
+        let _ = host.log_messages();
+        let words: [u32; 14] = [3, 0, 0, 0, 16, 0, 16, 0x0001_0001, 42, 1, 0, 0, 4, 0];
+        let mut resource = std::ptr::null();
+        assert_eq!(crate::resource::create_at_address(
+            std::ptr::null(), 0x10000, words.as_ptr().cast(), 0,
+            std::ptr::null(), &RESOURCE_IID, &mut resource,
+        ), S_OK);
+        let heap: ID3D12DescriptorHeap = unsafe {
+            // SAFETY: plain CPU-only descriptor heap creation.
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                ..Default::default()
+            }).unwrap()
+        };
+        let view = View::Shader(resource as usize, Some([67, 4, 5768, 0, 0, 1, 0, 0, 0, 0]));
+        // SAFETY: plain query on live heap.
+        let at = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        let kept = make(&view, at).unwrap().unwrap();
+        // SAFETY: live resource.
+        assert_eq!(unsafe { kept.GetDesc() }.Format, DXGI_FORMAT_R9G9B9E5_SHAREDEXP);
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, resource, 0xc0);
+        crate::list::ensure_state(&list, resource, 0xc0);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        crate::list::ensure_state(&list, resource, 8);
+        crate::list::ensure_state(&list, resource, 0xc0);
+        list.close();
+        host.execute(&[&list]);
+
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut allocator, mut title_list) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(
+            crate::list::create_allocator(std::ptr::null(), 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(std::ptr::null(), 0, 0, allocator, std::ptr::null(), &list_iid, &mut title_list),
+            S_OK
+        );
+        let write = crate::list::Barrier {
+            kind: 0,
+            flags: 0,
+            first: resource,
+            second: 0xffff_ffff | (u64::from(0xc0u32) << 32),
+            last: 8,
+        };
+        let read = crate::list::Barrier {
+            kind: 0,
+            flags: 0,
+            first: resource,
+            second: 0xffff_ffff | (u64::from(8u32) << 32),
+            last: 0xc0,
+        };
+        slot::<extern "system" fn(This, u32, *const crate::list::Barrier) -> u32>(title_list, 0xd0)(
+            title_list,
+            1,
+            &write,
+        );
+        slot::<extern "system" fn(This, u32, *const crate::list::Barrier) -> u32>(title_list, 0xd0)(
+            title_list,
+            1,
+            &read,
+        );
+        assert_eq!(slot::<extern "system" fn(This) -> crate::object::HRESULT>(title_list, 0x48)(title_list), S_OK);
+        host.execute(&[crate::list::host_list(title_list).unwrap()]);
+        let msgs = host.log_messages();
+        assert!(msgs.is_none(), "unexpected D3D12 validation errors: {msgs:?}");
+        // SAFETY: plain removal-reason query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "{msgs:?}");
+        slot::<extern "system" fn(This) -> u32>(title_list, 0x10)(title_list);
+        slot::<extern "system" fn(This) -> u32>(allocator, 0x10)(allocator);
+        slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
+    }
 
     #[repr(C)]
     struct ExtendedHeapDesc {
