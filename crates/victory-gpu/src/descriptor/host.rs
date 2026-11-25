@@ -525,11 +525,11 @@ fn dynamic_capped() -> u32 {
         .map_or(DYNAMIC_CAPPED, |n| n.clamp(1 << 16, 1 << 19))
 }
 
-/// Whether the host caps shader-visible view heaps at [`PORTABLE_VIEWS`]
-/// (NVIDIA), and if so tells the translator (`set_view_heap_limit`) before
-/// the first shader is translated: shaders translated before the view heap
-/// is made would otherwise read view indices past it unclamped, the read
-/// that hangs NVIDIA's GPU. Called before every translation; runs once.
+/// Whether the padded heap shaders expect fits, and if not tells the
+/// translator about the portable fallback before the first translation.
+/// Probing just `PORTABLE_VIEWS + 1` is not enough: NVIDIA accepted that
+/// size here but rejected `VIEW_SLOTS`, so early shaders had no clamp.
+/// Called before every translation; runs once.
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -538,16 +538,24 @@ pub(crate) fn probe_view_limit() {
         let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
             host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: PORTABLE_VIEWS + 1,
+                NumDescriptors: victory_shader::emit::VIEW_SLOTS,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
         };
-        if made.is_err() {
-            tracing::info!(
-                "the host caps view heaps at {PORTABLE_VIEWS}: view indices are clamped to its null slot"
-            );
-            victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+        match made {
+            Ok(_) => tracing::info!(
+                slots = victory_shader::emit::VIEW_SLOTS,
+                "padded host view heap supported"
+            ),
+            Err(e) => {
+                victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+                tracing::info!(
+                    error = %e,
+                    null_slot = PORTABLE_VIEWS - 1,
+                    "padded host view heap unavailable: view indices clamped before the first shader"
+                );
+            }
         }
     });
 }
@@ -708,7 +716,13 @@ impl HostHeap {
         let started = std::time::Instant::now();
         // SAFETY: a plain call on a live heap.
         let total = unsafe { h.heap.GetDesc() }.NumDescriptors;
-        if !sampler && total < victory_shader::emit::VIEW_SLOTS {
+        let limit = victory_shader::emit::view_heap_limit();
+        let shader_slots = if limit == 0 {
+            victory_shader::emit::VIEW_SLOTS
+        } else {
+            limit + 1
+        };
+        if !sampler && total < shader_slots {
             tracing::warn!(total, "a view heap shorter than shaders keep their indices in");
         }
         if let Err(e) = h.fill_null(kind, total) {
@@ -3031,6 +3045,26 @@ void main() {
         assert_eq!(dimension(Some(6)), D3D12_UAV_DIMENSION_TEXTURE2D);
     }
 
+    /// The capacity check must use the heap shaders actually expect,
+    /// not a size just one slot above the portable fallback.
+    #[test]
+    fn view_heap_limit_matches_padded_heap_capacity() {
+        let Some(host) = host() else { return };
+        probe_view_limit();
+        // SAFETY: plain heap creation, released before the assertion.
+        let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: victory_shader::emit::VIEW_SLOTS,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+        };
+        let expected = if made.is_ok() { 0 } else { PORTABLE_VIEWS - 1 };
+        drop(made);
+        assert_eq!(victory_shader::emit::view_heap_limit(), expected);
+    }
+
     /// A null 3D UAV made on the real device leaves it alive.
     #[test]
     fn null_3d_uav_is_accepted_by_the_device() {
@@ -3052,14 +3086,17 @@ void main() {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
+        // A capped heap's dynamic reserve starts after its actual title
+        // slots, which need not be the requested four.
+        let first = heap.count();
         let a = heap.dynamic(heap.spare - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + heap.spare - 100));
+        assert_eq!((a, b), (first, first + heap.spare - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
         heap.release(a, 50);
-        assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + heap.spare - 40));
+        assert_eq!(heap.dynamic(50), Some(first));
+        assert_eq!(heap.dynamic(40), Some(first + heap.spare - 40));
     }
 
     /// A sampler heap past the host's limit is capped, not lost, and keeps

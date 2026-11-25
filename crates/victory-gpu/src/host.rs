@@ -1106,6 +1106,15 @@ impl Host {
     fn reap_completed(&self) {
         // SAFETY: a plain fence query.
         let completed = unsafe { self.fence.GetCompletedValue() };
+        // D3D12 returns UINT64_MAX on removal, not "all work completed".
+        // Report the GPU failure before retiring resources or allowing the
+        // title to carry on and crash later at an unrelated null pointer.
+        if completed == u64::MAX {
+            fail(format_args!(
+                "host GPU device removed during an asynchronous submission{}",
+                self.removal_data(&[])
+            ));
+        }
         let mut last_sub = 0u64;
         loop {
             let done = {
