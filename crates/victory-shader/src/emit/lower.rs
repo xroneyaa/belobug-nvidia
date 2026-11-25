@@ -1127,6 +1127,72 @@ fn is_lds_op(i: &Inst) -> bool {
         && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
 }
 
+fn cyclic_sccs(succ: &[Vec<usize>]) -> (Vec<usize>, Vec<bool>) {
+    let n = succ.len();
+    let mut rev = vec![Vec::new(); n];
+    let mut self_loop = vec![false; n];
+    for (u, outs) in succ.iter().enumerate() {
+        for &v in outs {
+            if v == u {
+                self_loop[u] = true;
+            }
+            if v < n {
+                rev[v].push(u);
+            }
+        }
+    }
+    let mut visited = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for start in 0..n {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        stack.push((start, 0));
+        while let Some((u, next)) = stack.last_mut() {
+            let idx = *next;
+            let u = *u;
+            if idx < succ[u].len() {
+                *next += 1;
+                let v = succ[u][idx];
+                if v < n && !visited[v] {
+                    visited[v] = true;
+                    stack.push((v, 0));
+                }
+            } else {
+                stack.pop();
+                order.push(u);
+            }
+        }
+    }
+    let mut scc_id = vec![usize::MAX; n];
+    let mut in_cycle = Vec::new();
+    let mut dfs = Vec::new();
+    while let Some(root) = order.pop() {
+        if scc_id[root] != usize::MAX {
+            continue;
+        }
+        let id = in_cycle.len();
+        scc_id[root] = id;
+        dfs.push(root);
+        let mut count = 0usize;
+        let mut looped = false;
+        while let Some(u) = dfs.pop() {
+            count += 1;
+            looped |= self_loop[u];
+            for &p in &rev[u] {
+                if scc_id[p] == usize::MAX {
+                    scc_id[p] = id;
+                    dfs.push(p);
+                }
+            }
+        }
+        in_cycle.push(count > 1 || looped);
+    }
+    (scc_id, in_cycle)
+}
+
 fn cta_uniform_blocks(
     p: &Program,
     io: &crate::io::Io,
@@ -1218,21 +1284,8 @@ fn cta_uniform_blocks(
         }
     }
 
-    let can_reach = |start: usize, target: usize| -> bool {
-        let mut seen = vec![false; n];
-        let mut stack = vec![start];
-        while let Some(u) = stack.pop() {
-            if u == target {
-                return true;
-            }
-            if !seen[u] {
-                seen[u] = true;
-                stack.extend(succ[u].iter().copied());
-            }
-        }
-        false
-    };
-
+    let (scc_id, in_cycle) = cyclic_sccs(succ);
+    let mut bad_scc = vec![false; in_cycle.len()];
     let mut all = vec![true; n];
     loop {
         all.fill(true);
@@ -1261,19 +1314,16 @@ fn cta_uniform_blocks(
         }
         // Any block sharing a cycle with a non-all block can run different
         // iteration counts across host waves and is not CTA-uniform.
-        let mut loop_changed = true;
-        while loop_changed {
-            loop_changed = false;
-            for b in 0..n {
-                if all[b]
-                    && p.blocks[b]
-                        .preds
-                        .iter()
-                        .any(|&q| q < n && !all[q] && can_reach(b, q))
-                {
-                    all[b] = false;
-                    loop_changed = true;
-                }
+        bad_scc.fill(false);
+        for b in 0..n {
+            let id = scc_id[b];
+            if !all[b] && in_cycle[id] {
+                bad_scc[id] = true;
+            }
+        }
+        for b in 0..n {
+            if all[b] && bad_scc[scc_id[b]] {
+                all[b] = false;
             }
         }
 

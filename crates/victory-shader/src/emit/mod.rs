@@ -368,45 +368,53 @@ pub fn emit(
                 resource::track_with(&fp, &native.layout, native.stage, res.addresses).ok()?;
             Some((fp, fst, fio, fres))
         };
-        let early = build_form(ir::without_early_outs(p));
-        let skips = build_form(ir::without_skips(p, false));
-        let deep = build_form(ir::without_skips(p, true));
-        for form in [&early, &skips, &deep] {
-            if let Some((fp, fst, fio, fres)) = form
-                && let Ok(shader) = emit_program_with(
-                    c,
-                    native,
-                    fp,
-                    fst,
-                    fio,
-                    fres,
-                    target,
+        let mut early = None;
+        let mut skips = None;
+        let mut deep = None;
+        let try_form = |slot: &mut Option<Option<(ir::Program, structure::Structured, io::Io, resource::Resources)>>,
+                        make: fn(&ir::Program) -> Option<ir::Program>,
+                        mode| {
+            let form = slot.get_or_insert_with(|| build_form(make(p)));
+            let (fp, fst, fio, fres) = form.as_ref()?;
+            if mode == lower::LocalWaves::Idiom && lower::wave_local(fp, fst).is_err() {
+                return None;
+            }
+            emit_program_with(c, native, fp, fst, fio, fres, target, mode).ok()
+        };
+        if let Some(shader) = try_form(&mut early, ir::without_early_outs, lower::LocalWaves::Off)
+            .or_else(|| {
+                try_form(
+                    &mut skips,
+                    |prog| ir::without_skips(prog, false),
                     lower::LocalWaves::Off,
                 )
-            {
-                return Ok(shader);
-            }
+            })
+            .or_else(|| {
+                try_form(
+                    &mut deep,
+                    |prog| ir::without_skips(prog, true),
+                    lower::LocalWaves::Off,
+                )
+            })
+        {
+            return Ok(shader);
         }
         let local_mode = std::env::var("VICTORY_WAVE_LOCAL").unwrap_or_default();
         let local_on = local_mode != "0" && !exact_only;
         let strict = local_mode == "idiom";
         if local_on {
-            for form in [&early, &skips] {
-                if let Some((fp, fst, fio, fres)) = form
-                    && lower::wave_local(fp, fst).is_ok()
-                    && let Ok(shader) = emit_program_with(
-                        c,
-                        native,
-                        fp,
-                        fst,
-                        fio,
-                        fres,
-                        target,
-                        lower::LocalWaves::Idiom,
-                    )
-                {
-                    return Ok(shader);
-                }
+            if let Some(shader) =
+                try_form(&mut early, ir::without_early_outs, lower::LocalWaves::Idiom).or_else(
+                    || {
+                        try_form(
+                            &mut skips,
+                            |prog| ir::without_skips(prog, false),
+                            lower::LocalWaves::Idiom,
+                        )
+                    },
+                )
+            {
+                return Ok(shader);
             }
             if lower::wave_local(p, st).is_ok()
                 && let Ok(shader) =
@@ -415,21 +423,18 @@ pub fn emit(
                 return Ok(shader);
             }
             if !strict {
-                for form in [&early, &skips] {
-                    if let Some((fp, fst, fio, fres)) = form
-                        && let Ok(shader) = emit_program_with(
-                            c,
-                            native,
-                            fp,
-                            fst,
-                            fio,
-                            fres,
-                            target,
-                            lower::LocalWaves::Any,
-                        )
-                    {
-                        return Ok(shader);
-                    }
+                if let Some(shader) =
+                    try_form(&mut early, ir::without_early_outs, lower::LocalWaves::Any).or_else(
+                        || {
+                            try_form(
+                                &mut skips,
+                                |prog| ir::without_skips(prog, false),
+                                lower::LocalWaves::Any,
+                            )
+                        },
+                    )
+                {
+                    return Ok(shader);
                 }
                 if let Ok(shader) =
                     emit_program_with(c, native, p, st, io, res, target, lower::LocalWaves::Any)
