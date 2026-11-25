@@ -39,7 +39,7 @@ pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 struct Library {
     library: ID3D12PipelineLibrary1,
     /// The blob the library was made from: it must outlive the library.
-    _blob: Vec<u8>,
+    _blob: Blob,
     /// Pipelines stored since the last save.
     added: u64,
 }
@@ -49,19 +49,155 @@ struct Library {
 unsafe impl Send for Library {}
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
+const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
+
+/// Whether the library file is memory-mapped rather than copied into heap
+/// buffers (`VICTORY_LIBRARY_MAP=0` disables mapping).
+fn mapped() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_MAP").is_none_or(|v| v != "0"))
+}
+
+/// Whole file mapped into virtual memory for reading (`Mapped::open`) or
+/// writing (`Mapped::create`). Unmapped when dropped.
+struct Mapped {
+    at: windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS,
+    len: usize,
+    /// Keeps the backing file handle open while mapped on Windows so replacing
+    /// `host-pipelines.bin` with a newer save does not zero unpaged file blocks.
+    _file: Option<std::fs::File>,
+}
+
+// SAFETY: the view is read-only when opened or uniquely owned when created, and
+// unmapped once in `Drop`.
+unsafe impl Send for Mapped {}
+
+impl Mapped {
+    fn map(file: &std::fs::File, len: usize, write: bool) -> Option<Mapped> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, PAGE_READONLY,
+            PAGE_READWRITE,
+        };
+        if len == 0 {
+            return None;
+        }
+        // SAFETY: `file` is valid and stays open across mapping creation; the
+        // view holds a kernel reference until `UnmapViewOfFile`.
+        let at = unsafe {
+            let mapping = CreateFileMappingW(
+                file.as_raw_handle(),
+                std::ptr::null(),
+                if write { PAGE_READWRITE } else { PAGE_READONLY },
+                0,
+                0,
+                std::ptr::null(),
+            );
+            if mapping.is_null() {
+                return None;
+            }
+            let at = MapViewOfFile(
+                mapping,
+                if write { FILE_MAP_WRITE } else { FILE_MAP_READ },
+                0,
+                0,
+                0,
+            );
+            CloseHandle(mapping);
+            at
+        };
+        (!at.Value.is_null()).then_some(Mapped {
+            at,
+            len,
+            _file: None,
+        })
+    }
+
+    fn open(path: &std::path::Path) -> Option<Mapped> {
+        let file = std::fs::File::open(path).ok()?;
+        let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
+        let mut mapped = Mapped::map(&file, len, false)?;
+        mapped._file = Some(file);
+        Some(mapped)
+    }
+
+    fn create(path: &std::path::Path, len: usize) -> Option<Mapped> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .ok()?;
+        file.set_len(len as u64).ok()?;
+        Mapped::map(&file, len, true)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: the view holds `len` valid bytes until dropped.
+        unsafe { std::slice::from_raw_parts(self.at.Value.cast(), self.len) }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: writable view of `len` bytes created exclusively by `Mapped::create`.
+        unsafe { std::slice::from_raw_parts_mut(self.at.Value.cast(), self.len) }
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        // SAFETY: valid view created by `MapViewOfFile`.
+        unsafe { windows_sys::Win32::System::Memory::UnmapViewOfFile(self.at) };
+    }
+}
+
+enum Blob {
+    None,
+    Held(Vec<u8>),
+    Mapped(Mapped),
+}
+
+impl Blob {
+    fn of(dir: &std::path::Path) -> Blob {
+        let path = dir.join(LIBRARY_FILE);
+        let next = dir.join(NEXT_FILE);
+        if next.exists() && std::fs::rename(&next, &path).is_err() {
+            tracing::warn!("the host pipeline library saved last could not take the old one's place");
+        }
+        if mapped()
+            && let Some(file) = Mapped::open(&path)
+        {
+            return Blob::Mapped(file);
+        }
+        match std::fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => Blob::Held(bytes),
+            _ => Blob::None,
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Blob::None => &[],
+            Blob::Held(bytes) => bytes,
+            Blob::Mapped(file) => file.bytes(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes().is_empty()
+    }
+}
 
 fn library() -> Option<&'static Mutex<Library>> {
     static LIBRARY: OnceLock<Option<Mutex<Library>>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR
-                .get()
-                .and_then(|d| std::fs::read(d.join(LIBRARY_FILE)).ok())
-                .unwrap_or_default();
+            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -73,7 +209,7 @@ fn library() -> Option<&'static Mutex<Library>> {
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
-fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
+fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
@@ -81,9 +217,13 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
         }
     };
     if !blob.is_empty() {
-        match make(&blob) {
+        match make(blob.bytes()) {
             Ok(library) => {
-                tracing::info!(bytes = blob.len(), "host pipeline library loaded");
+                tracing::info!(
+                    bytes = blob.bytes().len(),
+                    mapped = matches!(blob, Blob::Mapped(_)),
+                    "host pipeline library loaded"
+                );
                 return Some(Library { library, _blob: blob, added: 0 });
             }
             Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
@@ -91,8 +231,9 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
     }
+    drop(blob);
     let library = make(&[]).ok()?;
-    Some(Library { library, _blob: Vec::new(), added: 0 })
+    Some(Library { library, _blob: Blob::None, added: 0 })
 }
 
 /// A pipeline's name in the library: the hash of what its host
@@ -400,28 +541,37 @@ pub(crate) fn save(now: bool) {
         return;
     }
     *last = Some(std::time::Instant::now());
-    let (blob, saved_additions) = {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(error = %e, "host pipeline cache dir not created");
+        return;
+    }
+    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let (bytes_written, saved_additions) = {
         let l = library.lock().unwrap_or_else(|e| e.into_inner());
         if l.added == 0 && !USED_CHANGED.load(Ordering::Relaxed) {
             return;
         }
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe {
-            let mut bytes = vec![0u8; l.library.GetSerializedSize()];
-            l.library.Serialize(&mut bytes).map(|()| bytes)
-        };
-        match bytes {
-            Ok(bytes) => (bytes, l.added),
-            Err(e) => {
+        if l.added == 0 {
+            (0, 0)
+        } else {
+            // SAFETY: a plain query.
+            let size = unsafe { l.library.GetSerializedSize() };
+            if let Err(e) = serialise(&l.library, &tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
+                let _ = std::fs::remove_file(&tmp);
                 return;
             }
+            (size, l.added)
         }
     };
     let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
+    let library_written = if bytes_written > 0 {
+        replace_library(dir, &tmp)
+    } else {
+        Ok(())
+    };
+    let written = library_written
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => {
@@ -429,7 +579,7 @@ pub(crate) fn save(now: bool) {
             // Keep pipelines stored while the files were being written.
             l.added = l.added.saturating_sub(saved_additions);
             tracing::info!(
-                bytes = blob.len(),
+                bytes = bytes_written,
                 early = used.len(),
                 made = MADE.load(Ordering::Relaxed),
                 loaded = LOADED.load(Ordering::Relaxed),
@@ -438,6 +588,7 @@ pub(crate) fn save(now: bool) {
             );
         }
         Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
             // At least one cache file was not published. Keep the counters
             // dirty for the next save.
             if used_changed {
@@ -446,6 +597,29 @@ pub(crate) fn save(now: bool) {
             tracing::warn!(error = %e, "host pipeline library not saved");
         }
     }
+}
+
+fn serialise(
+    library: &ID3D12PipelineLibrary1,
+    tmp: &std::path::Path,
+    size: usize,
+) -> std::io::Result<()> {
+    let failed = |e: windows::core::Error| std::io::Error::other(e.to_string());
+    if mapped()
+        && let Some(mut file) = Mapped::create(tmp, size)
+    {
+        // SAFETY: `file` is mapped for exactly `size` writable bytes.
+        return unsafe { library.Serialize(file.bytes_mut()) }.map_err(failed);
+    }
+    let mut bytes = vec![0u8; size];
+    // SAFETY: a buffer of the size the library asks for.
+    unsafe { library.Serialize(&mut bytes) }.map_err(failed)?;
+    std::fs::write(tmp, &bytes)
+}
+
+fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, dir.join(LIBRARY_FILE))
+        .or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
 }
 
 /// Writes `bytes` to a unique temporary file beside `path`, then renames it
@@ -519,10 +693,25 @@ mod tests {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
-        let library = open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
+        let library = open(&device, Blob::Held(b"not a pipeline library".repeat(16)))
+            .expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());
+    }
+
+    #[test]
+    fn mapped_library_file_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        let payload: Vec<u8> = (0..16 * 1024).map(|i| (i * 13 + 5) as u8).collect();
+        {
+            let mut writer = Mapped::create(&path, payload.len()).expect("mapped writer");
+            writer.bytes_mut().copy_from_slice(&payload);
+        }
+        let reader = Mapped::open(&path).expect("mapped reader");
+        assert_eq!(reader.bytes(), &payload[..]);
+        drop(reader);
     }
 
     #[test]

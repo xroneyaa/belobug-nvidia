@@ -159,6 +159,49 @@ fn evict(map: &mut HashMap<usize, Arc<Staging>>, more: u64) {
     }
 }
 
+/// Releases idle staging buffers down to a quarter of [`budget`] under low
+/// system commit pressure.
+pub(crate) fn trim_staging() {
+    let target = budget() / 4;
+    if STAGED.load(Ordering::Relaxed) <= target {
+        return;
+    }
+    let mut dropped: Vec<Arc<Staging>> = Vec::new();
+    let mut freed = 0u64;
+    {
+        let mut guard = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = guard.as_mut() else {
+            return;
+        };
+        let mut idle: Vec<(u64, usize, u64)> = map
+            .iter()
+            .filter(|(_, s)| Arc::strong_count(s) == 1)
+            .map(|(&k, s)| (s.used.load(Ordering::Relaxed), k, s.size))
+            .collect();
+        idle.sort_unstable();
+        for (_, key, size) in idle {
+            if STAGED.load(Ordering::Relaxed) <= target {
+                break;
+            }
+            if let Some(removed) = map.remove(&key) {
+                STAGED.fetch_sub(size, Ordering::Relaxed);
+                freed += size;
+                dropped.push(removed);
+            }
+        }
+    }
+    let count = dropped.len();
+    drop(dropped);
+    if count > 0 {
+        tracing::info!(
+            count,
+            freed_mib = freed >> 20,
+            kept_mib = STAGED.load(Ordering::Relaxed) >> 20,
+            "trimmed idle texture staging buffers under commit pressure"
+        );
+    }
+}
+
 thread_local! {
     /// Texture memory read for hashing and detiling: one per submitting
     /// thread, as large as the largest texture it read.

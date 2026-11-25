@@ -1339,10 +1339,26 @@ fn video_memory_percent() -> u64 {
     last.1
 }
 
+/// Target maximum side length for auto-capped streamed textures.
+/// On 8 GB GPUs (dedicated VRAM <= 8500 MiB), cap at 512 then 256 to avoid
+/// spilling textures across PCIe into system RAM.
+#[cfg(windows)]
+fn auto_texture_max(dedicated_vram_mb: u64, used_percent: u64) -> u64 {
+    if dedicated_vram_mb > 0 && dedicated_vram_mb <= 8500 {
+        if used_percent < 60 { 512 } else { 256 }
+    } else {
+        match used_percent {
+            0..70 => 1024,
+            70..85 => 512,
+            _ => 256,
+        }
+    }
+}
+
 /// How many of a streamed texture's largest mips to do without, for none of
 /// its sides to pass `VICTORY_TEXTURE_MAX`: by default 1024, 512 and then 256 as
-/// video memory fills up. All textures together did not fit, and paging them
-/// cost seconds a frame, or the driver failed.
+/// video memory fills up (512/256 on 8 GB GPUs). All textures together did not
+/// fit, and paging them cost seconds a frame, or the driver failed.
 #[cfg(windows)]
 fn over_cap(d: &ResourceDesc) -> u32 {
     static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1354,10 +1370,8 @@ fn over_cap(d: &ResourceDesc) -> u32 {
     if !STREAMED.get() || textures() != Textures::Stream {
         return 0;
     }
-    let max = set.unwrap_or_else(|| match video_memory_percent() {
-        0..70 => 1024,
-        70..85 => 512,
-        _ => 256,
+    let max = set.unwrap_or_else(|| {
+        auto_texture_max(crate::host::dedicated_vram_mb(), video_memory_percent())
     });
     const TEXTURE2D: u32 = 3;
     let block = (70..=84).contains(&d.format) || (94..=99).contains(&d.format);
@@ -3091,5 +3105,15 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn auto_texture_max_respects_vram_tier() {
+        assert_eq!(super::auto_texture_max(8024, 50), 512);
+        assert_eq!(super::auto_texture_max(8024, 60), 256);
+        assert_eq!(super::auto_texture_max(16384, 50), 1024);
+        assert_eq!(super::auto_texture_max(16384, 75), 512);
+        assert_eq!(super::auto_texture_max(16384, 90), 256);
     }
 }

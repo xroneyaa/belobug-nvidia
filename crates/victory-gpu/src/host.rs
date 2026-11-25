@@ -120,13 +120,77 @@ static RETIRED: Mutex<std::collections::VecDeque<Retired>> =
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Dedicated VRAM reported by the chosen DXGI adapter (MiB; 0 if unknown/WARP).
+static DEDICATED_VRAM_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Dedicated VRAM reported by the chosen host adapter in MiB (0 if unknown).
+pub(crate) fn dedicated_vram_mb() -> u64 {
+    DEDICATED_VRAM_MB.load(Ordering::Relaxed)
+}
+
+static LOW_COMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn low_commit_threshold() -> u64 {
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_LOW_COMMIT_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(4096)
+            << 20
+    })
+}
+
+fn is_low_commit(avail_bytes: u64, threshold_bytes: u64) -> bool {
+    threshold_bytes > 0 && avail_bytes < threshold_bytes
+}
+
+fn refresh_memory_pressure() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain zeroed Win32 output struct with `dwLength` initialized.
+    let mut mem: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    mem.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: `mem.dwLength` is initialized to `size_of::<MEMORYSTATUSEX>()` above.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut mem) } != 0;
+    let low = if ok {
+        is_low_commit(mem.ullAvailPageFile, low_commit_threshold())
+    } else {
+        false
+    };
+    let prev = LOW_COMMIT.swap(low, Ordering::Relaxed);
+    if low && !prev {
+        let avail_mb = mem.ullAvailPageFile >> 20;
+        tracing::info!(avail_mb, "low system commit; trimming idle GPU caches");
+    }
+    low
+}
+
+/// Whether the host recently observed low available system commit charge.
+pub(crate) fn memory_pressure() -> bool {
+    LOW_COMMIT.load(Ordering::Relaxed)
+}
+
 /// Presented host frames a retired object is also kept for. Worker threads
 /// record lists ahead of submission and a title frame spans many
 /// submissions, so finishing the submissions running when it was retired
 /// is not enough on its own. Ages are in frames presented to the host, not
 /// the title's 60 Hz clock (which ticks many times per host frame while
-/// the host runs at 1-2 fps).
-const KEEP_FRAMES: u64 = 32;
+/// the host runs at 1-2 fps). `VICTORY_KEEP_FRAMES` overrides (default 4).
+fn keep_frames() -> u64 {
+    static BASE: OnceLock<u64> = OnceLock::new();
+    let base = *BASE.get_or_init(|| {
+        std::env::var("VICTORY_KEEP_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(4)
+            .max(1)
+    });
+    if memory_pressure() {
+        base.min(2)
+    } else {
+        base
+    }
+}
 
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired {
@@ -142,7 +206,7 @@ struct Retired {
 unsafe impl Send for Retired {}
 
 /// Drops `object` once every submission running now has finished and
-/// [`KEEP_FRAMES`] more frames were presented.
+/// [`keep_frames`] more frames were presented.
 pub(crate) fn retire<T: 'static>(object: T) {
     let submission = STARTED.load(Ordering::Acquire);
     let frame = crate::queue::presented();
@@ -162,14 +226,13 @@ fn bury(finished: u64) {
         return;
     }
     let now = crate::queue::presented();
+    let keep = keep_frames();
     let done: Vec<Retired> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         // In the order they came: the old ones are at the front.
         let n = retired
             .iter()
-            .take_while(|r| {
-                r.submission <= finished && now.saturating_sub(r.frame) >= KEEP_FRAMES
-            })
+            .take_while(|r| r.submission <= finished && now.saturating_sub(r.frame) >= keep)
             .count();
         retired.drain(..n).collect()
     };
@@ -498,6 +561,7 @@ fn fastest_adapter() -> windows::core::Result<IDXGIAdapter1> {
         let adapter: IDXGIAdapter1 =
             factory.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)?;
         let desc = adapter.GetDesc1()?;
+        DEDICATED_VRAM_MB.store((desc.DedicatedVideoMemory >> 20) as u64, Ordering::Relaxed);
         let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
         tracing::info!(
             name = String::from_utf16_lossy(&desc.Description[..end]),
@@ -894,6 +958,38 @@ impl Scratch {
     }
 }
 
+/// Drops spare scratch upload chunks above 8 MiB when system commit is low.
+fn trim_scratch() {
+    const PRESSURE_KEPT: usize = 16;
+    let over: Vec<_> = {
+        let mut free = SCRATCH_FREE.lock().unwrap_or_else(|e| e.into_inner());
+        let extra = free.len().saturating_sub(PRESSURE_KEPT);
+        free.drain(..extra).collect()
+    };
+    drop(over);
+}
+
+/// Periodically checks system commit pressure and trims idle host caches
+/// outside the submission lock.
+fn pressure_sweep() {
+    if cfg!(test) {
+        return;
+    }
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1)) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    if refresh_memory_pressure() {
+        trim_scratch();
+        crate::texture::trim_staging();
+        crate::shadow::sweep_now();
+    }
+}
+
 impl Drop for Scratch {
     fn drop(&mut self) {
         if self.chunks.is_empty() {
@@ -1262,6 +1358,7 @@ impl Host {
     }
 
     fn execute_inner(&self, runs: &[&HostList], keep: Option<&[std::sync::Arc<HostList>]>) {
+        pressure_sweep();
         #[cfg(feature = "diagnostics")]
         let _inside = crate::profile::here();
         // One submission at a time from preparation to copy-back: snapshots
@@ -4478,6 +4575,15 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
         // SAFETY: our reservation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn low_commit_detects_threshold_crossing() {
+        use super::is_low_commit;
+        assert!(!is_low_commit(100, 0));
+        assert!(is_low_commit(4095, 4096));
+        assert!(!is_low_commit(4096, 4096));
+        assert!(!is_low_commit(8192, 4096));
     }
 }
 

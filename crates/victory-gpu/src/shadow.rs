@@ -1454,10 +1454,26 @@ struct Tile {
 /// Address space a sparse copy stands for.
 const CHUNK: u64 = 2 << 30;
 
+struct TileHeap {
+    whole: ID3D12Resource,
+    heap: windows::Win32::Graphics::Direct3D12::ID3D12Heap,
+    data: usize,
+    live: u32,
+}
+
+impl Drop for TileHeap {
+    fn drop(&mut self) {
+        // SAFETY: persistently mapped once in `new_tile`; unmapping before
+        // releasing keeps the D3D12 debug layer clean.
+        unsafe { self.whole.Unmap(0, None) };
+    }
+}
+
 /// Memory for tiles, in heaps the CPU maps.
 struct TilePool {
-    heaps: Vec<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, ID3D12Resource, usize)>,
-    /// Tiles used of the last one.
+    heaps: Vec<Option<TileHeap>>,
+    /// Heap currently being bump-allocated from, and tiles handed out of it.
+    active: Option<usize>,
     used: u32,
     /// Tiles given back.
     free: Vec<Tile>,
@@ -1467,6 +1483,7 @@ unsafe impl Send for TilePool {}
 
 static TILES: Mutex<TilePool> = Mutex::new(TilePool {
     heaps: Vec::new(),
+    active: None,
     used: 0,
     free: Vec::new(),
 });
@@ -1476,11 +1493,18 @@ const POOL_TILES: u32 = 512;
 fn new_tile() -> Option<Tile> {
     use windows::Win32::Graphics::Direct3D12::*;
     let mut pool = TILES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(tile) = pool.free.pop() {
-        crate::memstat::add(&crate::memstat::SHADOWS, PAGE as u64);
-        return Some(tile);
+    while let Some(tile) = pool.free.pop() {
+        if let Some(Some(h)) = pool.heaps.get_mut(tile.heap) {
+            h.live += 1;
+            crate::memstat::add(&crate::memstat::SHADOWS, PAGE as u64);
+            return Some(tile);
+        }
     }
-    if pool.heaps.is_empty() || pool.used == POOL_TILES {
+    let need_heap = pool
+        .active
+        .filter(|&idx| pool.used < POOL_TILES && pool.heaps.get(idx).and_then(Option::as_ref).is_some())
+        .is_none();
+    if need_heap {
         let size = u64::from(POOL_TILES) * PAGE as u64;
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: size,
@@ -1496,7 +1520,7 @@ fn new_tile() -> Option<Tile> {
         let mut heap: Option<ID3D12Heap> = None;
         let mut whole: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation; the mapping lives as long as the heap.
+        // SAFETY: plain creation; the mapping lives as long as `TileHeap`.
         let made = unsafe {
             let device = &host()?.device;
             device.CreateHeap(&desc, &mut heap).and_then(|()| {
@@ -1520,19 +1544,65 @@ fn new_tile() -> Option<Tile> {
         }
         let heap = heap?;
         crate::memstat::track(&heap, 5, size);
-        pool.heaps.push((heap, whole?, data as usize));
+        let entry = TileHeap {
+            heap,
+            whole: whole?,
+            data: data as usize,
+            live: 0,
+        };
+        let idx = if let Some(slot) = pool.heaps.iter().position(Option::is_none) {
+            pool.heaps[slot] = Some(entry);
+            slot
+        } else {
+            pool.heaps.push(Some(entry));
+            pool.heaps.len() - 1
+        };
+        pool.active = Some(idx);
         pool.used = 0;
     }
-    let heap = pool.heaps.len() - 1;
+    let idx = pool.active?;
     let offset = pool.used;
     pool.used += 1;
+    let h = pool.heaps.get_mut(idx)?.as_mut()?;
+    h.live += 1;
     crate::memstat::add(&crate::memstat::SHADOWS, PAGE as u64);
     Some(Tile {
-        data: pool.heaps[heap].2 + offset as usize * PAGE,
-        heap,
+        data: h.data + offset as usize * PAGE,
+        heap: idx,
         offset,
         used: 0,
     })
+}
+
+/// Drops completely empty full tile heaps back to the OS, keeping one heap of
+/// free tiles unless `pressure` requires releasing every empty heap.
+fn reclaim_empty_tile_heaps(pressure: bool) -> Vec<TileHeap> {
+    let mut pool = TILES.lock().unwrap_or_else(|e| e.into_inner());
+    let keep_reserve = if pressure { 0 } else { POOL_TILES as usize };
+    let mut free_kept = pool.free.len();
+    let mut retired = Vec::new();
+    for idx in 0..pool.heaps.len() {
+        let can_drop = pool.heaps[idx].as_ref().is_some_and(|h| {
+            h.live == 0 && (pool.active != Some(idx) || pool.used == POOL_TILES)
+        });
+        if !can_drop {
+            continue;
+        }
+        let in_free = pool.free.iter().filter(|t| t.heap == idx).count();
+        if free_kept.saturating_sub(in_free) < keep_reserve {
+            continue;
+        }
+        pool.free.retain(|t| t.heap != idx);
+        free_kept = pool.free.len();
+        if pool.active == Some(idx) {
+            pool.active = None;
+            pool.used = 0;
+        }
+        if let Some(h) = pool.heaps[idx].take() {
+            retired.push(h);
+        }
+    }
+    retired
 }
 
 /// Which tiles are given back (`VICTORY_SWEEP_TILES`): 0 none, 1 those
@@ -1556,18 +1626,45 @@ fn sweeps() -> u8 {
 /// Gives back the tiles nothing has asked about for some frames: what
 /// viewed them is gone. At the present of `frame`.
 pub(crate) fn sweep(frame: u64) {
-    const EVERY: u64 = 32;
+    sweep_inner(frame, false);
+}
+
+/// Immediately reclaims unmapped title-memory tiles when `VICTORY_SWEEP_TILES >= 2`.
+pub(crate) fn sweep_now() {
+    if sweeps() >= 2 {
+        sweep_inner(crate::queue::presented(), true);
+    }
+}
+
+fn sweep_inner(frame: u64, force: bool) {
     let mode = sweeps();
-    if !frame.is_multiple_of(EVERY) || mode == 0 {
+    if mode == 0 {
         return;
     }
-    // Once a frame, whoever asks.
-    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if LAST.swap(frame, Ordering::Relaxed) == frame {
-        return;
-    }
+    let pressure = crate::host::memory_pressure();
     let gone_only = mode >= 2;
-    let keep: u64 = if gone_only { 600 } else { 120 };
+    let every: u64 = if gone_only {
+        if pressure { 2 } else { 8 }
+    } else {
+        32
+    };
+    if !force && !frame.is_multiple_of(every) {
+        return;
+    }
+    if !force {
+        // Once a frame, whoever asks.
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if LAST.swap(frame, Ordering::Relaxed) == frame {
+            return;
+        }
+    }
+    let keep: u64 = if gone_only {
+        if pressure { 4 } else { 16 }
+    } else if pressure && !cfg!(test) {
+        32
+    } else {
+        120
+    };
     let mut given = 0u64;
     let started = std::time::Instant::now();
     let all: Vec<Arc<Shadow>> = SPARSE
@@ -1663,11 +1760,24 @@ pub(crate) fn sweep(frame: u64) {
             );
         }
         crate::memstat::sub(&crate::memstat::SHADOWS, (old.len() * PAGE) as u64);
-        TILES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .free
-            .extend(old.into_iter().map(|o| o.1));
+        {
+            let mut pool = TILES.lock().unwrap_or_else(|e| e.into_inner());
+            for (_, tile) in old {
+                if let Some(Some(heap)) = pool.heaps.get_mut(tile.heap) {
+                    heap.live = heap.live.saturating_sub(1);
+                }
+                pool.free.push(tile);
+            }
+        }
+    }
+    if given > 0 || pressure {
+        let retired = reclaim_empty_tile_heaps(pressure);
+        if !retired.is_empty() {
+            let heaps = retired.len();
+            let megabytes = (heaps as u64 * u64::from(POOL_TILES) * PAGE as u64) >> 20;
+            tracing::info!(heaps, megabytes, frame, "tile heaps released");
+            crate::host::retire(retired);
+        }
     }
     let took = started.elapsed();
     if given > 0 || took > std::time::Duration::from_millis(20) {
@@ -1685,30 +1795,37 @@ pub(crate) fn sweep(frame: u64) {
 fn unmap_tiles(buffer: &ID3D12Resource, tiles: impl Iterator<Item = u32>) {
     use windows::Win32::Graphics::Direct3D12::*;
     let Some(host) = host() else { return };
-    for at in tiles {
-        let coordinate = D3D12_TILED_RESOURCE_COORDINATE {
+    let coords: Vec<D3D12_TILED_RESOURCE_COORDINATE> = tiles
+        .map(|at| D3D12_TILED_RESOURCE_COORDINATE {
             X: at,
             ..Default::default()
-        };
-        let region = D3D12_TILE_REGION_SIZE {
+        })
+        .collect();
+    if coords.is_empty() {
+        return;
+    }
+    let regions = vec![
+        D3D12_TILE_REGION_SIZE {
             NumTiles: 1,
             ..Default::default()
         };
-        // SAFETY: a live sparse buffer, a tile inside it.
-        unsafe {
-            host.queue().UpdateTileMappings(
-                buffer,
-                1,
-                Some(&coordinate),
-                Some(&region),
-                None,
-                1,
-                Some(&D3D12_TILE_RANGE_FLAG_NULL),
-                None,
-                Some(&1),
-                D3D12_TILE_MAPPING_FLAG_NONE,
-            );
-        }
+        coords.len()
+    ];
+    let total = coords.len() as u32;
+    // SAFETY: live sparse buffer; `total` single-tile regions are unmapped to NULL.
+    unsafe {
+        host.queue().UpdateTileMappings(
+            buffer,
+            total,
+            Some(coords.as_ptr()),
+            Some(regions.as_ptr()),
+            None,
+            1,
+            Some(&D3D12_TILE_RANGE_FLAG_NULL),
+            None,
+            Some(&total),
+            D3D12_TILE_MAPPING_FLAG_NONE,
+        );
     }
 }
 
@@ -1822,32 +1939,53 @@ pub(crate) fn declare(list: &HostList, address: u64, len: u64) {
     root.refresh(list, address, end - address);
 }
 
-/// Maps tiles of a sparse buffer (`first`, then each the next) to heaps.
+/// Maps tiles of a sparse buffer (`first`, then each the next) to heaps,
+/// batched into one `UpdateTileMappings` call per backing heap.
 fn map_tiles(buffer: &ID3D12Resource, tiles: &[(u32, Tile)]) {
     use windows::Win32::Graphics::Direct3D12::*;
+    if tiles.is_empty() {
+        return;
+    }
     let Some(host) = host() else { return };
-    let pool = TILES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut by_heap: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
     for &(at, tile) in tiles {
-        let coordinate = D3D12_TILED_RESOURCE_COORDINATE {
-            X: at,
-            ..Default::default()
+        by_heap.entry(tile.heap).or_default().push((at, tile.offset));
+    }
+    let pool = TILES.lock().unwrap_or_else(|e| e.into_inner());
+    for (heap_idx, group) in by_heap {
+        let Some(Some(entry)) = pool.heaps.get(heap_idx) else {
+            continue;
         };
-        let region = D3D12_TILE_REGION_SIZE {
-            NumTiles: 1,
-            ..Default::default()
-        };
-        // SAFETY: a live sparse buffer and heap, tiles inside both.
+        let n = group.len();
+        let coords: Vec<D3D12_TILED_RESOURCE_COORDINATE> = group
+            .iter()
+            .map(|&(at, _)| D3D12_TILED_RESOURCE_COORDINATE {
+                X: at,
+                ..Default::default()
+            })
+            .collect();
+        let regions = vec![
+            D3D12_TILE_REGION_SIZE {
+                NumTiles: 1,
+                ..Default::default()
+            };
+            n
+        ];
+        let flags = vec![D3D12_TILE_RANGE_FLAG_NONE; n];
+        let offsets: Vec<u32> = group.iter().map(|&(_, offset)| offset).collect();
+        let counts = vec![1u32; n];
+        // SAFETY: live sparse buffer and heap; region and range tile counts both equal `n`.
         unsafe {
             host.queue().UpdateTileMappings(
                 buffer,
-                1,
-                Some(&coordinate),
-                Some(&region),
-                &pool.heaps[tile.heap].0,
-                1,
-                Some(&D3D12_TILE_RANGE_FLAG_NONE),
-                Some(&tile.offset),
-                Some(&1),
+                n as u32,
+                Some(coords.as_ptr()),
+                Some(regions.as_ptr()),
+                &entry.heap,
+                n as u32,
+                Some(flags.as_ptr()),
+                Some(offsets.as_ptr()),
+                Some(counts.as_ptr()),
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
         }
@@ -1899,6 +2037,18 @@ impl Shadow {
         }
     }
 
+    /// Maximum alias buffers per 2 GiB sparse chunk before falling back to
+    /// raw windowing on the root buffer (`VICTORY_MAX_SPARSE_ALIASES`, default 16).
+    fn max_sparse_aliases() -> usize {
+        static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *MAX.get_or_init(|| {
+            std::env::var("VICTORY_MAX_SPARSE_ALIASES")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(16)
+        })
+    }
+
     /// A sparse copy from a start `address` is a multiple of `element` bytes
     /// after.
     fn sparse_on_element(self: &Arc<Self>, address: u64, element: u64) -> Option<Arc<Shadow>> {
@@ -1908,11 +2058,14 @@ impl Shadow {
         let s = self.sparse.as_ref()?;
         let page = PAGE as u64;
         let mut base = self.start + page;
-        while base <= address && base - self.start <= 4096 * page {
+        while base <= address && base - self.start <= 16 * page {
             if (address - base) % element == 0 {
                 let mut aliases = s.aliases.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(a) = aliases.iter().find(|a| a.start == base) {
                     return Some(a.clone());
+                }
+                if aliases.len() >= Self::max_sparse_aliases() {
+                    return Some(self.clone());
                 }
                 let len = self.start + self.len - base;
                 let made = Arc::new(sparse_buffer(base, len, Some(self.clone()))?);
@@ -1932,7 +2085,7 @@ impl Shadow {
             }
             base += page;
         }
-        None
+        Some(self.clone())
     }
 
     /// The CPU's views of each tile's part of `[from, to)`: its title
@@ -2596,5 +2749,68 @@ mod tests {
             cached[2],
             baseline[2].as_secs_f64() / cached[2].as_secs_f64(),
         );
+    }
+
+    static TEST_TILES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn batched_tile_mapping_and_unmapping() {
+        let _tiles_guard = TEST_TILES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = host() else { return };
+        let _ = host.log_messages();
+        let reserved = sparse_buffer(0, u64::from(POOL_TILES + 8) * PAGE as u64, None).unwrap();
+        let mut tiles = Vec::new();
+        for at in 0..8u32 {
+            tiles.push((at, new_tile().expect("tile")));
+        }
+        map_tiles(&reserved.buffer, &tiles);
+        unmap_tiles(&reserved.buffer, tiles.iter().map(|&(at, _)| at));
+        let list = host.new_list().unwrap();
+        list.close();
+        host.execute(&[&list]);
+        // Return the test tiles to the pool after GPU queue work finishes.
+        {
+            let mut pool = TILES.lock().unwrap_or_else(|e| e.into_inner());
+            for (_, tile) in tiles {
+                if let Some(Some(heap)) = pool.heaps.get_mut(tile.heap) {
+                    heap.live = heap.live.saturating_sub(1);
+                }
+                pool.free.push(tile);
+            }
+        }
+        crate::memstat::sub(&crate::memstat::SHADOWS, (8 * PAGE) as u64);
+        let msgs = host.log_messages();
+        assert!(msgs.is_none(), "unexpected D3D12 errors: {msgs:?}");
+        // SAFETY: plain removal-reason query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn empty_full_tile_heaps_are_reclaimed() {
+        let _tiles_guard = TEST_TILES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_host) = host() else { return };
+        // Allocate enough tiles to guarantee at least one full 512-tile heap
+        // that can be reclaimed once all its tiles return to `free`.
+        let count = POOL_TILES as usize + 16;
+        let mut allocated = Vec::with_capacity(count);
+        for _ in 0..count {
+            allocated.push(new_tile().expect("tile"));
+        }
+        let distinct_heaps: std::collections::BTreeSet<usize> =
+            allocated.iter().map(|t| t.heap).collect();
+        assert!(distinct_heaps.len() >= 2);
+        {
+            let mut pool = TILES.lock().unwrap_or_else(|e| e.into_inner());
+            for tile in allocated {
+                if let Some(Some(heap)) = pool.heaps.get_mut(tile.heap) {
+                    heap.live = heap.live.saturating_sub(1);
+                }
+                pool.free.push(tile);
+            }
+        }
+        crate::memstat::sub(&crate::memstat::SHADOWS, (count * PAGE) as u64);
+        let retired = reclaim_empty_tile_heaps(true);
+        assert!(!retired.is_empty(), "expected at least one empty full tile heap to be reclaimed");
+        drop(retired);
     }
 }
