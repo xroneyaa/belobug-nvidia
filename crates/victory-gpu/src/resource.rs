@@ -837,6 +837,8 @@ struct Resource {
     #[cfg(windows)]
     streamed: bool,
     #[cfg(windows)]
+    placed: bool,
+    #[cfg(windows)]
     largest_mip: u32,
 }
 
@@ -846,14 +848,14 @@ static PLACED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 #[cfg(windows)]
 fn default_placed_budget_bytes(dedicated_vram_mb: u64) -> u64 {
     if dedicated_vram_mb > 0 && dedicated_vram_mb <= 8500 {
-        512 << 20
+        1024 << 20
     } else {
         0
     }
 }
 
 /// Host memory cap for streamed placed textures (`VICTORY_TEXTURE_BUDGET_MB`;
-/// 0 means unlimited; defaults to 512 MiB on 8 GB GPUs).
+/// 0 means unlimited; defaults to 1024 MiB on 8 GB GPUs).
 #[cfg(windows)]
 fn placed_budget_bytes() -> u64 {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -893,8 +895,12 @@ pub(crate) struct HostTexture {
     pub(crate) slot: Option<crate::texpool::Slot>,
     /// The title's largest mips it goes without ([`over_cap`]).
     pub(crate) skip: u32,
-    /// Whether it is a streamed placed texture counted in [`PLACED_BYTES`].
-    pub(crate) streamed: bool,
+    /// Whether it is a placed texture counted in [`PLACED_BYTES`].
+    pub(crate) placed: bool,
+    /// Whether it is an R32 render/UAV target whose R9G9B9E5 reads use a copy bridge.
+    pub(crate) r32_target: bool,
+    /// Set across submissions when this texture was written and needs a shared-exponent copy.
+    pub(crate) shared_dirty: std::sync::atomic::AtomicBool,
     /// When a list last moved it to a state shaders or draws write in, in
     /// order: of textures in the same memory, the last holds its contents.
     pub(crate) written: std::sync::atomic::AtomicU64,
@@ -1099,6 +1105,33 @@ fn shared_cast_allowed(device: &windows::Win32::Graphics::Direct3D12::ID3D12Devi
     query().unwrap_or(false)
 }
 
+/// R32 textures whose shared-exponent shadow copy has been created and may need
+/// syncing across command-list boundaries.
+#[cfg(windows)]
+static SHARED_SOURCES: std::sync::Mutex<Vec<std::sync::Weak<HostTexture>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Returns every live R32 target whose shared-exponent copy was marked dirty since
+/// the last prelude sync, clearing its dirty bit.
+#[cfg(windows)]
+pub(crate) fn take_dirty_shared_exponents() -> Vec<std::sync::Arc<HostTexture>> {
+    use std::sync::atomic::Ordering;
+    let mut list = SHARED_SOURCES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut dirty = Vec::new();
+    list.retain(|weak| {
+        let Some(src) = weak.upgrade() else {
+            return false;
+        };
+        if src.shared_copy.get().and_then(Option::as_ref).is_some()
+            && src.shared_dirty.swap(false, Ordering::AcqRel)
+        {
+            dirty.push(src);
+        }
+        true
+    });
+    dirty
+}
+
 /// The shared-exponent read-only view of a written 32-bit texture. Copies via
 /// a device-local buffer and `CopyTextureRegion` keep exact bit patterns across
 /// typeless format families where direct view casting removes the device.
@@ -1222,19 +1255,29 @@ pub(crate) fn shared_exponent<'a>(this: This) -> Option<&'a SharedExponentCopy> 
             crate::memstat::add(&crate::memstat::HOST_TEXTURE_COUNT, 1);
             #[cfg(feature = "diagnostics")]
             census(&texture, bytes as i64);
+            let shared_tex = std::sync::Arc::new(HostTexture {
+                texture,
+                state: std::sync::atomic::AtomicU32::new(0xc0),
+                bytes,
+                slot: None,
+                skip: 0,
+                placed: false,
+                r32_target: false,
+                shared_dirty: Default::default(),
+                written: Default::default(),
+                twin: Default::default(),
+                shared_cast: false,
+                shared_copy: Default::default(),
+            });
+            copy.shared_dirty
+                .store(true, std::sync::atomic::Ordering::Release);
+            {
+                let mut list = SHARED_SOURCES.lock().unwrap_or_else(|e| e.into_inner());
+                list.retain(|w| w.strong_count() > 0);
+                list.push(std::sync::Arc::downgrade(copy));
+            }
             Some(SharedExponentCopy {
-                texture: std::sync::Arc::new(HostTexture {
-                    texture,
-                    state: std::sync::atomic::AtomicU32::new(0xc0),
-                    bytes,
-                    slot: None,
-                    skip: 0,
-                    streamed: false,
-                    written: Default::default(),
-                    twin: Default::default(),
-                    shared_cast: false,
-                    shared_copy: Default::default(),
-                }),
+                texture: shared_tex,
                 buffer,
                 parts: from_rows.into_iter().zip(to_rows).collect(),
             })
@@ -1260,7 +1303,7 @@ impl Drop for HostTexture {
     fn drop(&mut self) {
         crate::memstat::sub(&crate::memstat::HOST_TEXTURES, self.bytes);
         crate::memstat::sub(&crate::memstat::HOST_TEXTURE_COUNT, 1);
-        if self.streamed {
+        if self.placed {
             crate::memstat::sub(&PLACED_BYTES, self.bytes);
         }
         #[cfg(feature = "diagnostics")]
@@ -1351,17 +1394,23 @@ impl Resource {
                 let bytes = allocation_bytes(&texture);
                 crate::memstat::add(&crate::memstat::HOST_TEXTURES, bytes);
                 crate::memstat::add(&crate::memstat::HOST_TEXTURE_COUNT, 1);
-                if self.streamed {
+                if self.placed {
                     PLACED_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
                 }
                 #[cfg(feature = "diagnostics")]
                 census(&texture, bytes as i64);
+                let r32_target = !common
+                    && (39..=43).contains(&self.desc.format)
+                    && self.desc.flags & 5 != 0
+                    && self.desc.flags & 2 == 0;
                 Some(std::sync::Arc::new(HostTexture {
                     texture,
                     bytes,
                     slot,
                     skip,
-                    streamed: self.streamed,
+                    placed: self.placed,
+                    r32_target,
+                    shared_dirty: Default::default(),
                     written: Default::default(),
                     twin: Default::default(),
                     shared_cast: common,
@@ -1424,6 +1473,8 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 thread_local! {
     /// The texture being made is one the title placed in memory it streams.
     static STREAMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The texture being made is created through [`texture_at`] and counts toward [`PLACED_BYTES`].
+    static PLACED_AT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Of it, the largest mip the title's view reads: memory of larger ones
     /// may be another texture's.
     static LARGEST: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -1747,6 +1798,8 @@ fn hand_out_resource(
         #[cfg(windows)]
         streamed: STREAMED.get(),
         #[cfg(windows)]
+        placed: PLACED_AT.get(),
+        #[cfg(windows)]
         largest_mip: LARGEST.get(),
     });
     #[cfg(windows)]
@@ -1994,15 +2047,26 @@ impl Drop for HeldTexture {
     }
 }
 
-/// A reference to `texture` if it is a placed texture alive now.
+/// A reference to `texture` if it is a placed texture or target alias alive now.
 #[cfg(windows)]
 pub(crate) fn hold_placed(texture: This) -> Option<HeldTexture> {
-    let _map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    let live = PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner());
-    live.contains(&(texture as usize)).then(|| {
+    let key = texture as usize;
+    let found = {
+        let _map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let live = PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        live.contains(&key)
+    };
+    if found {
         object::add_ref(texture);
-        HeldTexture(texture)
-    })
+        return Some(HeldTexture(texture));
+    }
+    let targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    if targets.values().any(|list| list.contains(&key)) {
+        object::add_ref(texture);
+        Some(HeldTexture(texture))
+    } else {
+        None
+    }
 }
 
 /// The placed textures alive now, and the longest there was. Locked after
@@ -2070,6 +2134,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
     let mut out = std::ptr::null();
     // Outside the lock: making one takes a while.
     LARGEST.set(largest);
+    PLACED_AT.set(true);
     let made = create_at_address(
         std::ptr::null(),
         address,
@@ -2079,6 +2144,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
         &RESOURCE_IIDS[0],
         &mut out,
     );
+    PLACED_AT.set(false);
     LARGEST.set(0);
     if made != S_OK {
         return None;
@@ -3216,9 +3282,69 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn placed_budget_respects_vram_tier() {
-        assert_eq!(super::default_placed_budget_bytes(8024), 512 << 20);
+        assert_eq!(super::default_placed_budget_bytes(8024), 1024 << 20);
         assert_eq!(super::default_placed_budget_bytes(16384), 0);
         assert_eq!(super::default_placed_budget_bytes(0), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_at_address_does_not_charge_placed_budget() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let tex_desc = ResourceDesc {
+            dimension: 3, // Texture2D
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28, // R8G8B8A8_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+        let mut backing = vec![0u8; 64 * 64 * 4];
+        let mut direct = null;
+        assert_eq!(
+            super::create_at_address(
+                null,
+                backing.as_mut_ptr() as u64,
+                &tex_desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut direct,
+            ),
+            S_OK
+        );
+        assert!(!resource(direct).placed);
+        let direct_host = super::host_copy(direct).expect("direct host copy");
+        assert!(!direct_host.placed);
+        drop(direct_host);
+        assert_eq!(slot::<Release>(direct, 0x10)(direct), 0);
+
+        let before = super::PLACED_BYTES.load(std::sync::atomic::Ordering::Acquire);
+        let words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 0x0001_0001, 28, 1, 0, 0x100, 0, 0];
+        let addr = backing.as_mut_ptr() as u64;
+        let placed = super::texture_at(addr, &words, 0).expect("placed texture");
+        assert!(resource(placed).placed);
+        let placed_host = super::host_copy(placed).expect("placed host copy");
+        assert!(placed_host.placed);
+        let bytes = placed_host.bytes;
+        drop(placed_host);
+        let during = super::PLACED_BYTES.load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            during >= before + bytes,
+            "texture_at placed texture must count toward PLACED_BYTES ({during} vs {before} + {bytes})"
+        );
+        let start = addr;
+        let end = addr.saturating_add(backing.len() as u64);
+        super::evict_placed_textures(start, end);
+        assert!(!super::has_placed_texture(addr, &words));
     }
 
     #[cfg(windows)]

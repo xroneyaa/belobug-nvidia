@@ -323,6 +323,19 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
     plain
 }
 
+fn is_wave64_refusal(what: &str) -> bool {
+    what.ends_with("where not every lane runs")
+        || matches!(
+            what,
+            "a lane mask holding lanes elsewhere read as data"
+                | "console wave64 lanes on a host without 64-lane waves"
+                | "a wave64 group sharing LDS without barriers on a host without 64-lane waves"
+                | "a lane mask read whole in a wave64 program split in halves"
+                | "a wave reduction in a wave64 program split in halves"
+                | "a lane permutation in a wave64 program split in halves"
+        )
+}
+
 /// Emits a program whose earlier stages already ran, for `target`.
 pub fn emit(
     c: &Container,
@@ -333,7 +346,99 @@ pub fn emit(
     res: &resource::Resources,
     target: Target,
 ) -> Result<HostShader, ShaderError> {
-    let original = emit_program(c, native, p, st, io, res, target);
+    let original = emit_program_with(c, native, p, st, io, res, target, lower::LocalWaves::Off);
+    let exact_only = matches!(
+        &original,
+        Err(ShaderError::Unsupported { what, .. })
+            if *what == "a lane mask holding lanes elsewhere read as data"
+    );
+    if let Err(ShaderError::Unsupported { what, .. }) = &original
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && !target.runs(64)
+        && target.runs(32)
+        && is_wave64_refusal(what)
+    {
+        let build_form = |transformed: Option<ir::Program>| {
+            let mut fp = transformed?;
+            crate::sgpr_spill::forward(&mut fp);
+            let fst = structure::structure(&fp).ok()?;
+            let fio = io::raise(&fp, native).ok()?;
+            let fres =
+                resource::track_with(&fp, &native.layout, native.stage, res.addresses).ok()?;
+            Some((fp, fst, fio, fres))
+        };
+        let early = build_form(ir::without_early_outs(p));
+        let skips = build_form(ir::without_skips(p, false));
+        let deep = build_form(ir::without_skips(p, true));
+        for form in [&early, &skips, &deep] {
+            if let Some((fp, fst, fio, fres)) = form
+                && let Ok(shader) = emit_program_with(
+                    c,
+                    native,
+                    fp,
+                    fst,
+                    fio,
+                    fres,
+                    target,
+                    lower::LocalWaves::Off,
+                )
+            {
+                return Ok(shader);
+            }
+        }
+        let local_mode = std::env::var("VICTORY_WAVE_LOCAL").unwrap_or_default();
+        let local_on = local_mode != "0" && !exact_only;
+        let strict = local_mode == "idiom";
+        if local_on {
+            for form in [&early, &skips] {
+                if let Some((fp, fst, fio, fres)) = form
+                    && lower::wave_local(fp, fst).is_ok()
+                    && let Ok(shader) = emit_program_with(
+                        c,
+                        native,
+                        fp,
+                        fst,
+                        fio,
+                        fres,
+                        target,
+                        lower::LocalWaves::Idiom,
+                    )
+                {
+                    return Ok(shader);
+                }
+            }
+            if lower::wave_local(p, st).is_ok()
+                && let Ok(shader) =
+                    emit_program_with(c, native, p, st, io, res, target, lower::LocalWaves::Idiom)
+            {
+                return Ok(shader);
+            }
+            if !strict {
+                for form in [&early, &skips] {
+                    if let Some((fp, fst, fio, fres)) = form
+                        && let Ok(shader) = emit_program_with(
+                            c,
+                            native,
+                            fp,
+                            fst,
+                            fio,
+                            fres,
+                            target,
+                            lower::LocalWaves::Any,
+                        )
+                    {
+                        return Ok(shader);
+                    }
+                }
+                if let Ok(shader) =
+                    emit_program_with(c, native, p, st, io, res, target, lower::LocalWaves::Any)
+                {
+                    return Ok(shader);
+                }
+            }
+        }
+    }
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -349,10 +454,10 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track_with(&p, &native.layout, native.stage, res.addresses)?;
-    emit_program(c, native, &p, &st, &io, &res, target)
+    emit_program_with(c, native, &p, &st, &io, &res, target, lower::LocalWaves::Off)
 }
 
-fn emit_program(
+fn emit_program_with(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -360,6 +465,7 @@ fn emit_program(
     io: &io::Io,
     res: &resource::Resources,
     target: Target,
+    local_waves: lower::LocalWaves,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -454,6 +560,7 @@ fn emit_program(
         target,
         console_cf: false,
         per_lane_only: false,
+        local_waves,
     };
     let l = match lower::lower(&parts) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
@@ -1094,16 +1201,10 @@ mod tests {
         assert!(emit_for(&wave64, Target::ANY).is_ok());
         assert!(emit_for(&wave64, RDNA).is_ok());
         assert!(emit_for(&wave64, NVIDIA).is_ok());
-        // Two per group: the halves cannot meet at a group barrier yet.
+        // Two per group: halves exchange via group-shared memory on NVIDIA.
         let two = compute_of(&words, true, 128);
         assert!(emit_for(&two, RDNA).is_ok());
-        assert_eq!(
-            emit_for(&two, NVIDIA),
-            Err(crate::ShaderError::Unsupported {
-                offset: 0,
-                what: "console wave64 lanes on a host without 64-lane waves",
-            })
-        );
+        assert!(emit_for(&two, NVIDIA).is_ok());
         // The same code in waves of 32 runs on either.
         let wave32 = compute(&words, false);
         assert!(emit_for(&wave32, NVIDIA).is_ok());
@@ -1121,28 +1222,21 @@ mod tests {
         eprintln!("host waves {}-{}", target.lanes_min, target.lanes_max);
         let words = [0xD760_0000, 0x0001_0B00, 0x7E02_0200, 0xBF81_0000];
         for wave64 in [false, true] {
-            match emit_for(&compute_of(&words, wave64, 128), target) {
-                Ok(cs) => {
-                    if let Err(e) = host.compute_pipeline(&cs) {
-                        panic!("wave64 {wave64}: translated for the host, refused by it: {e}");
-                    }
-                }
-                Err(e) => {
-                    assert!(wave64 && !target.runs(64), "{e}");
-                    // What it replaces: the host refuses the console's
-                    // wave size at pipeline creation.
-                    let any = emit_for(&compute_of(&words, true, 128), Target::ANY).unwrap();
-                    assert!(host.compute_pipeline(&any).is_err());
-                }
+            let cs = emit_for(&compute_of(&words, wave64, 128), target)
+                .unwrap_or_else(|e| panic!("wave64 {wave64}: expected translation: {e}"));
+            if let Err(e) = host.compute_pipeline(&cs) {
+                panic!("wave64 {wave64}: translated for the host, refused by it: {e}");
+            }
+            if wave64 && !target.runs(64) {
+                // Verify Target::ANY still emits Wave64 (which a Wave32 host refuses).
+                let any = emit_for(&compute_of(&words, true, 128), Target::ANY).unwrap();
+                assert!(host.compute_pipeline(&any).is_err());
             }
         }
     }
 
     /// On every hardware adapter: a wave64 program that reads other lanes
-    /// translates in groups of one console wave (natively or in the console
-    /// flow) and the adapter takes it; in groups of two it translates
-    /// exactly when the adapter runs 64-lane waves. On a machine with an AMD
-    /// and an NVIDIA GPU this checks both answers.
+    /// translates in groups of one or two console waves and the adapter takes it.
     #[test]
     #[cfg(windows)]
     fn each_adapter_gets_what_it_runs() {
@@ -1162,14 +1256,10 @@ mod tests {
                 emit_for(&compute(&words, true), target).unwrap_or_else(|e| panic!("{name}: {e}"));
             host.compute_pipeline(&one)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
-            match emit_for(&compute_of(&words, true, 128), target) {
-                Ok(cs) => {
-                    assert!(target.runs(64), "{name}");
-                    host.compute_pipeline(&cs)
-                        .unwrap_or_else(|e| panic!("{name}: {e}"));
-                }
-                Err(_) => assert!(!target.runs(64), "{name}"),
-            }
+            let two = emit_for(&compute_of(&words, true, 128), target)
+                .unwrap_or_else(|e| panic!("{name}: 128 threads: {e}"));
+            host.compute_pipeline(&two)
+                .unwrap_or_else(|e| panic!("{name}: 128 threads: {e}"));
         }
     }
 
@@ -1339,6 +1429,7 @@ mod tests {
             psv: None,
             console_cf: false,
             per_lane_only: false,
+            local_waves: super::lower::LocalWaves::Off,
         })
         .unwrap();
         let mut dxil = l.dxil;
@@ -1497,6 +1588,7 @@ mod tests {
             psv: None,
             console_cf: false,
             per_lane_only: false,
+            local_waves: super::lower::LocalWaves::Off,
         })
         .unwrap();
         let mut dxil = l.dxil;
@@ -1663,6 +1755,7 @@ mod tests {
             psv: None,
             console_cf: false,
             per_lane_only: false,
+            local_waves: super::lower::LocalWaves::Off,
         })
         .unwrap();
         assert!(l.stride_table);
@@ -1822,6 +1915,7 @@ mod tests {
             psv: None,
             console_cf: false,
             per_lane_only: false,
+            local_waves: super::lower::LocalWaves::Off,
         })
         .unwrap();
         let mut dxil = l.dxil;

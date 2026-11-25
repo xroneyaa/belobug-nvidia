@@ -296,6 +296,7 @@ pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
     let (Some(level), Some(host)) = (level(), host()) else {
         return false;
     };
+    let light_this = light;
     let Some(light) = crate::resource::host_resource(light) else {
         return false;
     };
@@ -378,6 +379,7 @@ pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
         l.Dispatch((d.Width as u32).div_ceil(8), d.Height.div_ceil(8), 1);
     }
     uav_barrier(l);
+    list.note_shared_write(light_this);
     true
 }
 

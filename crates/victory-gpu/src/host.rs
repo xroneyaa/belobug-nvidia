@@ -676,6 +676,9 @@ pub(crate) struct HostList {
     /// R32 textures copied to their shared-exponent read view since the last
     /// write transition in this recording. Cleared on reset and on writes.
     shared_synced: Mutex<std::collections::HashSet<usize>>,
+    /// R32 render/UAV targets written during this recording, to sync either
+    /// at the next barrier/bindless read or at submission via `shared_dirty`.
+    r32_dirty: Mutex<std::collections::HashMap<usize, std::sync::Arc<crate::resource::HostTexture>>>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// What the title's list held for this recording, if the title reset or
@@ -1063,8 +1066,8 @@ impl Host {
                 "host wave sizes"
             );
             if !target.runs(64) {
-                tracing::warn!(
-                    "the host has no 64-lane waves: console wave64 compute programs that read                      other lanes do not translate, and their dispatches are dropped"
+                tracing::info!(
+                    "host max wave size is 32: lowering console wave64 compute shaders to 32-lane waves"
                 );
             }
             target
@@ -1098,6 +1101,7 @@ impl Host {
             Ok(HostList {
                 allocator,
                 shared_synced: Mutex::default(),
+                r32_dirty: Mutex::default(),
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
                 list,
                 deferred: Mutex::default(),
@@ -2018,6 +2022,7 @@ impl HostList {
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.shared_synced.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.r32_dirty.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.queries.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -2050,12 +2055,61 @@ impl HostList {
         let copy = crate::resource::host_copy(resource)?;
         let wanted = legal_state(texture, wanted);
         let key = std::sync::Arc::as_ptr(&copy) as usize;
-        if copy.shared_copy.get().is_some_and(Option::is_some)
-            && wanted & (0x4 | 0x8 | 0x400 | 0x1000) != 0
-        {
+        if copy.r32_target && wanted & (0x4 | 0x8 | 0x400 | 0x1000) != 0 {
             self.shared_synced.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+            self.r32_dirty
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, copy.clone());
         }
         self.transition_copy(copy, wanted).map(|before| (texture, before))
+    }
+
+    /// Marks an R32 render/UAV target as written in this recording so its
+    /// shared-exponent read view is refreshed on the next read, barrier, or submission.
+    pub(crate) fn note_shared_write(&self, resource: crate::object::This) {
+        let Some(copy) = crate::resource::host_copy(resource) else { return };
+        if !copy.r32_target {
+            return;
+        }
+        let key = std::sync::Arc::as_ptr(&copy) as usize;
+        self.shared_synced.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        self.r32_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, copy);
+    }
+
+    /// Refreshes every R32 target written in this recording that already has an
+    /// initialized shared-exponent shadow copy (used at enhanced barriers and bindless draws).
+    pub(crate) fn flush_dirty_shared_exponents(&self) {
+        let ready: Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)> = {
+            let mut dirty = self.r32_dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let keys: Vec<usize> = dirty
+                .iter()
+                .filter(|(_, c)| c.shared_copy.get().and_then(Option::as_ref).is_some())
+                .map(|(&k, _)| k)
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| dirty.remove(&k).map(|c| (k, c)))
+                .collect()
+        };
+        for (key, source) in ready {
+            let Some(shared) = source.shared_copy.get().and_then(Option::as_ref) else {
+                continue;
+            };
+            let restore = self
+                .states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .map_or(0xc0, |&(_, last, _)| last);
+            self.shared_synced
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key);
+            self.copy_shared_exponent(&source, shared, restore);
+        }
     }
 
     /// Called at a shader read, after the title's barrier batch was emitted.
@@ -2096,6 +2150,11 @@ impl HostList {
         shared: &crate::resource::SharedExponentCopy,
         restore_state: u32,
     ) {
+        let key = std::sync::Arc::as_ptr(source) as usize;
+        self.r32_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
         let mut pre_barriers = vec![transition(
             &shared.buffer,
             D3D12_RESOURCE_STATE_COMMON,
@@ -2226,6 +2285,16 @@ impl HostList {
         )],
     ) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
+        const COPY_SOURCE: u32 = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+        const SRV_ANY: u32 = 0xc0;
+        let shared_syncs = crate::resource::take_dirty_shared_exponents();
+        let r32_written: Vec<std::sync::Arc<crate::resource::HostTexture>> = self
+            .r32_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
         let mut pre_barriers = Vec::new();
         for (_, copy) in uploads {
             let real = copy.state.swap(COPY_DEST, Ordering::Relaxed);
@@ -2236,6 +2305,38 @@ impl HostList {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ));
             }
+        }
+        let mut shared_work = Vec::new();
+        for source in &shared_syncs {
+            let Some(shared) = source.shared_copy.get().and_then(Option::as_ref) else {
+                continue;
+            };
+            let mut sb = vec![transition(
+                &shared.buffer,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )];
+            let real_src = source.state.swap(COPY_SOURCE, Ordering::Relaxed);
+            if real_src != COPY_SOURCE {
+                sb.push(transition(
+                    &source.texture,
+                    D3D12_RESOURCE_STATES(real_src as i32),
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ));
+            }
+            let real_dst = shared.texture.state.swap(COPY_DEST, Ordering::Relaxed);
+            if real_dst != COPY_DEST {
+                sb.push(transition(
+                    &shared.texture.texture,
+                    D3D12_RESOURCE_STATES(real_dst as i32),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                ));
+            }
+            shared.texture.state.store(SRV_ANY, Ordering::Relaxed);
+            self.keep(&source.texture);
+            self.keep(&shared.texture.texture);
+            self.keep(&shared.buffer);
+            shared_work.push((source, shared, sb));
         }
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let post_barriers: Vec<D3D12_RESOURCE_BARRIER> = states
@@ -2251,9 +2352,30 @@ impl HostList {
                 })
             })
             .collect();
-        if uploads.is_empty() && post_barriers.is_empty() {
+        if uploads.is_empty() && shared_work.is_empty() && post_barriers.is_empty() {
+            for copy in r32_written {
+                copy.shared_dirty.store(true, Ordering::Release);
+            }
             return None;
         }
+        let subresource = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: index as u32,
+            },
+        };
+        let placed = |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+            D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(buffer) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: *footprint,
+                },
+            }
+        };
         let (allocator, list) = &self.prelude;
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures and staging buffers are live.
@@ -2266,12 +2388,56 @@ impl HostList {
                 for (staging, copy) in uploads {
                     staging.record_copies(list, &copy.texture);
                 }
+                for (source, shared, sb) in &shared_work {
+                    list.ResourceBarrier(sb);
+                    for (index, (of_from, _)) in shared.parts.iter().enumerate() {
+                        list.CopyTextureRegion(
+                            &placed(&shared.buffer, of_from),
+                            0,
+                            0,
+                            0,
+                            &subresource(&source.texture, index),
+                            None,
+                        );
+                    }
+                    list.ResourceBarrier(&[transition(
+                        &shared.buffer,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    for (index, (_, of_to)) in shared.parts.iter().enumerate() {
+                        list.CopyTextureRegion(
+                            &subresource(&shared.texture.texture, index),
+                            0,
+                            0,
+                            0,
+                            &placed(&shared.buffer, of_to),
+                            None,
+                        );
+                    }
+                    list.ResourceBarrier(&[
+                        transition(
+                            &shared.buffer,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_COMMON,
+                        ),
+                        transition(
+                            &shared.texture.texture,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        ),
+                    ]);
+                }
                 if !post_barriers.is_empty() {
                     list.ResourceBarrier(&post_barriers);
                 }
                 list.Close()
             })
         };
+        for copy in r32_written {
+            copy.shared_dirty.store(true, Ordering::Release);
+        }
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }

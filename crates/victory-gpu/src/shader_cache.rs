@@ -63,6 +63,11 @@ fn build() -> &'static [u8; 32] {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 bytes.push(victory_shader::emit::rays().into());
+                bytes.extend_from_slice(
+                    std::env::var("VICTORY_WAVE_LOCAL")
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

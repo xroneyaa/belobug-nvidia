@@ -193,7 +193,7 @@ fn translate(native: &NativeProgram, offset: usize) -> Result<(), (&'static str,
     let lowered = lower::lower(&lower::Parts {
         native, p: &p, st: &st, io: &io, res: &res, inputs: Vec::new(), outputs: Vec::new(),
         prims: Vec::new(), mesh_stride: 0,
-        target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false, psv: None,
+        target: crate::emit::Target::ANY, console_cf: false, per_lane_only: false, local_waves: Default::default(), psv: None,
     });
     lower::AUDIT_OFFSET.set(None);
     lowered.map(|_| ()).map_err(|e| ("lower", e))

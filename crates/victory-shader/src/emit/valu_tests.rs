@@ -1407,6 +1407,7 @@ fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
         psv: None,
         console_cf: false,
         per_lane_only: false,
+        local_waves: Default::default(),
     })
     .map_err(|e| format!("{e:?}"))?;
     Ok(HostShader {

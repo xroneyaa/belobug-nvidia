@@ -284,8 +284,8 @@ fn exchanges_inside_a_branch_one_half_skips() {
     });
 }
 
-/// Groups of several console waves need the halves to meet without a
-/// group barrier: not yet.
+/// Groups of several console waves run in the console flow with group
+/// exchange buffers between halves.
 #[test]
 fn console_flow_is_for_one_console_wave_per_group() {
     let body = [
@@ -298,7 +298,7 @@ fn console_flow_is_for_one_console_wave_per_group() {
         lanes_max: 32,
     };
     assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    assert!(emit_for(&program(&body, 128), nvidia).is_err());
+    assert!(emit_for(&program(&body, 128), nvidia).is_ok());
 }
 
 /// A loop lane t runs t times, with a lane read of the other half in
@@ -393,4 +393,324 @@ fn loops_with_an_exit_mask_grown_from_zero() {
         0x4A04_040C, // v_add_nc_u32 v2, s12, v2
     ];
     console_flow_case("exit-mask loop reading lane 40", &body, 64, |_| 40 + 64);
+}
+
+const SUM_BODY: &[u32] = &[
+    0xBE8A_25C1, // s_or_saveexec_b64 s[10:11], -1
+    0xD501_0001,
+    0x002A_0080, // v_cndmask_b32_e64 v1, 0, v0, s[10:11]
+    0x4A02_02FA,
+    0xFF01_6101, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:1
+    0x4A02_02FA,
+    0xFF01_6201, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:2
+    0x4A02_02FA,
+    0xFF01_6401, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:4
+    0x4A02_02FA,
+    0xFF01_6801, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:8
+    0xD778_0002,
+    0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+    0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
+    0xD760_000C,
+    0x0001_0101, // v_readlane_b32 s12, v1, 0
+    0xD760_000D,
+    0x0001_4101, // v_readlane_b32 s13, v1, 32
+    0x800C_0D0C, // s_add_u32 s12, s12, s13
+    0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+    0x7E04_020C, // v_mov_b32 v2, s12
+];
+
+// Masked WaveActiveBitOr: only t % 64 < 40 active, contributes 1 << ((t & 63) >> 1)
+const OR_BODY: [u32; 29] = [
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0x3608_00BF, // v_and_b32 v4, 63, v0
+    0x2C0A_0881, // v_lshrrev_b32 v5, 1, v4
+    0xD51A_0005,
+    0x0001_0305, // v_lshlrev_b32_e64 v5, v5, 1
+    0x7D88_08A8, // v_cmp_gt_u32 vcc, 40, v4
+    0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+    0xBE8A_25C1, // s_or_saveexec_b64 s[10:11], -1
+    0xD501_0001,
+    0x002A_0A80, // v_cndmask_b32_e64 v1, 0, v5, s[10:11]
+    0x3802_02FA,
+    0xFF01_6101, // v_or_b32_dpp v1, v1, v1 row_xmask:1
+    0x3802_02FA,
+    0xFF01_6201, // v_or_b32_dpp v1, v1, v1 row_xmask:2
+    0x3802_02FA,
+    0xFF01_6401, // v_or_b32_dpp v1, v1, v1 row_xmask:4
+    0x3802_02FA,
+    0xFF01_6801, // v_or_b32_dpp v1, v1, v1 row_xmask:8
+    0xD778_0002,
+    0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+    0x3802_0501, // v_or_b32_e32 v1, v1, v2
+    0xD760_000C,
+    0x0001_0101, // v_readlane_b32 s12, v1, 0
+    0xD760_000D,
+    0x0001_4101, // v_readlane_b32 s13, v1, 32
+    0x880C_0D0C, // s_or_b32 s12, s12, s13
+    0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+    0x7E04_020C, // v_mov_b32 v2, s12
+    0x88FE_0E7E, // s_or_b64 exec, exec, s[14:15]
+];
+
+const PREFIX_BODY: &[u32] = &[
+    0xBE8A_25C1, // s_or_saveexec_b64 s[10:11], -1
+    0xD501_0001,
+    0x002A_0080, // v_cndmask_b32_e64 v1, 0, v0, s[10:11]
+    0x4A02_02FA,
+    0xFF01_1101, // v_add_nc_u32_dpp v1, v1, v1 row_shr:1
+    0x4A02_02FA,
+    0xFF01_1201, // v_add_nc_u32_dpp v1, v1, v1 row_shr:2
+    0x4A02_02FA,
+    0xFF01_1401, // v_add_nc_u32_dpp v1, v1, v1 row_shr:4
+    0x4A02_02FA,
+    0xFF01_1801, // v_add_nc_u32_dpp v1, v1, v1 row_shr:8
+    0xD778_0002,
+    0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+    0x7E06_0280, // v_mov_b32_e32 v3, 0
+    0x7E06_02FA,
+    0xAF00_E402, // v_mov_b32_dpp v3, v2 quad_perm:[0,1,2,3] row_mask:0xa
+    0x4A02_0701, // v_add_nc_u32_e32 v1, v1, v3
+    0xD760_000C,
+    0x0001_3F01, // v_readlane_b32 s12, v1, 31
+    0xBEFE_0380, // s_mov_b32 exec_lo, 0
+    0x4A02_020C, // v_add_nc_u32_e32 v1, s12, v1
+    0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+    0x7E04_0301, // v_mov_b32 v2, v1
+];
+
+const LDS_NO_BARRIER_BODY: [u32; 11] = [
+    0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+    0x4A0A_00FF,
+    100,         // v_add_nc_u32 v5, 100, v0
+    0xD834_0000,
+    0x0000_0504, // ds_write_b32 v4, v5
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x3A08_00A0, // v_xor_b32 v4, 32, v0
+    0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+    0xD8D8_0000,
+    0x0200_0004, // ds_read_b32 v2, v4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
+const PERMLANE_BODY: [u32; 10] = [
+    0xBE8A_03FF,
+    0x89AB_CDEF, // s_mov_b32 s10, 0x89ABCDEF
+    0xBE8B_03FF,
+    0x0123_4567, // s_mov_b32 s11, 0x01234567
+    0xD777_0001,
+    0x002C_1500, // v_permlane16_b32 v1, v0, s10, s11
+    0xD778_0004,
+    0x002C_1500, // v_permlanex16_b32 v4, v0, s10, s11
+    0x3402_0288, // v_lshlrev_b32 v1, 8, v1
+    0x4A04_0901, // v_add_nc_u32 v2, v1, v4
+];
+
+const BPERMUTE_BODY: [u32; 7] = [
+    0x3608_00BF, // v_and_b32 v4, 63, v0
+    0x3A08_08A0, // v_xor_b32 v4, 32, v4
+    0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+    0x4A0A_0087, // v_add_nc_u32 v5, 7, v0
+    0xDACC_0000,
+    0x0200_0504, // ds_bpermute_b32 v2, v4, v5
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
+const EARLY_OUT_BODY: [u32; 8] = [
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+    0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+    0xBF89_0001, // s_cbranch_execnz +1
+    0xBF81_0000, // s_endpgm
+    0xD760_0009,
+    0x0001_4700, // v_readlane_b32 s9, v0, 35
+    0x4A04_0009, // v_add_nc_u32 v2, s9, v0
+];
+
+fn program_lds_no_barrier() -> crate::NativeProgram {
+    let mut native = program(&LDS_NO_BARRIER_BODY, 64);
+    if let StageIo::Cs(ref mut cs) = native.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    native
+}
+
+#[test]
+fn wave64_to_wave32_emits_and_validates_dxil_on_cpu() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let mut cases: Vec<(&str, crate::NativeProgram)> = vec![
+        ("sum 64", program(SUM_BODY, 64)),
+        ("sum 128", program(SUM_BODY, 128)),
+        ("or 64", program(&OR_BODY, 64)),
+        ("or 128", program(&OR_BODY, 128)),
+        ("prefix 64", program(PREFIX_BODY, 64)),
+        ("prefix 128", program(PREFIX_BODY, 128)),
+        ("lds no barrier", program_lds_no_barrier()),
+        ("permlane16/x16", program(&PERMLANE_BODY, 64)),
+        ("ds_bpermute 64", program(&BPERMUTE_BODY, 64)),
+        ("ds_bpermute 128", program(&BPERMUTE_BODY, 128)),
+        ("early-out 64", program(&EARLY_OUT_BODY, 64)),
+        ("early-out 128", program(&EARLY_OUT_BODY, 128)),
+    ];
+    for threads in [
+        [4, 4, 4],
+        [8, 8, 2],
+        [2, 4, 8],
+        [16, 2, 4],
+        [8, 8, 4],
+        [4, 8, 8],
+    ] {
+        cases.push(("3d group", program_3d(threads)));
+    }
+    #[cfg(windows)]
+    let mut validator =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+            .ok();
+    for (label, native) in &cases {
+        let cs = emit_for(native, nvidia).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(wave_size(&cs.dxil), Some(32), "{label}: wave size");
+        #[cfg(windows)]
+        if let Some(v) = &mut validator {
+            v.validate(&mut cs.dxil.clone())
+                .unwrap_or_else(|e| panic!("{label}: validation: {e}"));
+        }
+    }
+}
+
+#[test]
+fn per_wave_scalar_branch_does_not_exchange_across_cta() {
+    let body = [
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E12_0500, // v_readfirstlane_b32 s9, v0 (differs between wave 0 and wave 1!)
+        0xBF06_8009, // s_cmp_eq_u32 s9, 0
+        0xBF84_0003, // s_cbranch_scc0 +3
+        0xD760_000A,
+        0x0001_5100, // v_readlane_b32 s10, v0, 40
+        0x7E04_020A, // v_mov_b32 v2, s10
+    ];
+    let native = program(&body, 128);
+    let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let io = crate::io::raise(&p, &native).unwrap();
+    let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+    let st = crate::structure::structure(&p).unwrap();
+    let container = crate::dxbc::build(&[]);
+    let c = crate::Container::parse(&container).unwrap();
+    let off = super::lower::lower(&super::lower::Parts {
+        psv: None,
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        target: super::Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        },
+        console_cf: false,
+        per_lane_only: false,
+        local_waves: super::lower::LocalWaves::Off,
+    });
+    assert!(
+        off.is_err(),
+        "must refuse CTA-unsafe exchange inside per-wave scalar branch"
+    );
+    let _ = c;
+}
+
+#[test]
+fn multi_wave_group_lane_reads_stay_within_their_console_wave() {
+    let body = [
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case("128-thread lane read across halves", &body, 128, |t| {
+        40 + ((t % 128) / 64) * 64
+    });
+}
+
+#[test]
+fn wave64_reductions_and_prefix_sums_match_the_console_wave_on_wave32() {
+    for threads in [64u32, 128] {
+        console_flow_case("wave64 active sum section", SUM_BODY, threads, |t| {
+            let b = ((t % threads) / 64) * 64;
+            b * 64 + 63 * 64 / 2
+        });
+    }
+
+    for threads in [64u32, 128] {
+        console_flow_case("wave64 active bit-or section", &OR_BODY, threads, |t| {
+            let l = (t % threads) % 64;
+            if l < 40 { 0x000F_FFFF } else { 0 }
+        });
+    }
+
+    for threads in [64u32, 128] {
+        console_flow_case("wave64 inclusive prefix sum section", PREFIX_BODY, threads, |t| {
+            let local = t % threads;
+            let base = (local / 64) * 64;
+            let lane = local % 64;
+            (lane + 1) * (2 * base + lane) / 2
+        });
+    }
+}
+
+#[test]
+fn wave64_lds_sharing_without_barriers_runs_correctly_on_wave32() {
+    let native = program_lds_no_barrier();
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    let want: Vec<u32> = (0..8 * 64).map(|t| ((t % 64) ^ 32) + 100).collect();
+    for name in names {
+        let host = Host::on(&name).unwrap();
+        let target = host.target();
+        let cs = emit_for(&native, target).expect("wave64 LDS without barrier translates");
+        if !target.runs(64) {
+            assert_eq!(wave_size(&cs.dxil), Some(32));
+        }
+        let got = run(&host, &native, 8).expect("LDS without barrier validates and runs");
+        assert_eq!(got, want, "{name}: wave64 LDS without barrier");
+    }
+}
+
+#[test]
+fn wave64_permlane16_and_permlanex16_match_on_wave32() {
+    console_flow_case("wave64 permlane16/permlanex16", &PERMLANE_BODY, 64, |t| {
+        let l = t % 64;
+        let rev = (l & !15) | (15 - (l & 15));
+        let xrev = (l & !31) | ((l & 16) ^ 16) | (15 - (l & 15));
+        (rev << 8) + xrev
+    });
+}
+
+#[test]
+fn wave64_ds_bpermute_crosses_halves_on_wave32() {
+    for threads in [64u32, 128] {
+        console_flow_case("wave64 ds_bpermute across halves", &BPERMUTE_BODY, threads, |t| {
+            ((t % threads) ^ 32) + 7
+        });
+    }
+}
+
+#[test]
+fn wave64_early_out_followed_by_cross_half_lane_read_runs_on_wave32() {
+    for threads in [64u32, 128] {
+        console_flow_case(
+            "wave64 early-out before cross-half lane read",
+            &EARLY_OUT_BODY,
+            threads,
+            |t| {
+                let local = t % threads;
+                if local < 40 { 35 + local } else { 0 }
+            },
+        );
+    }
 }

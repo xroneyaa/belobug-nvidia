@@ -786,6 +786,7 @@ impl State {
             && let Some(host_heap) = crate::descriptor::heap(self.heaps[0] as This).host_arc()
         {
             host_heap.prepare_bindless_record(list);
+            list.flush_dirty_shared_exponents();
             let writes = p.stages.iter().any(|s| s.translated().writes_memory);
             list.defer_bindless(&host_heap, writes);
         }

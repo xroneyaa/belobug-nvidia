@@ -1597,7 +1597,7 @@ impl HostHeap {
             self.set_unmapped_null(index, &view);
             return Ok(None);
         }
-        let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view) else {
+        let Some(shader_view @ View::Shader(tex_res, desc_words)) = placed_texture(&view) else {
             self.set_unmapped_null(index, &view);
             return Ok(None);
         };
@@ -1606,8 +1606,17 @@ impl HostHeap {
             self.set_unmapped_null(index, &view);
             return Ok(None);
         };
+        let raw_tex = if desc_words
+            .as_ref()
+            .is_some_and(|w| crate::resource::pc_format(w[0]) == crate::resource::SHARED_EXPONENT)
+        {
+            crate::resource::shared_exponent(tex_this)
+                .map_or(host_tex.as_raw(), |h| h.texture.texture.as_raw())
+        } else {
+            host_tex.as_raw()
+        };
         let key = u64::from(generation) << 32 | u64::from(vi);
-        self.ensure_placed_slot(index, key, &shader_view, host_tex.as_raw());
+        self.ensure_placed_slot(index, key, &shader_view, raw_tex);
         Ok(Some(tex_this))
     }
 
@@ -2989,6 +2998,69 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "{msgs:?}");
         slot::<extern "system" fn(This) -> u32>(title_list, 0x10)(title_list);
         slot::<extern "system" fn(This) -> u32>(allocator, 0x10)(allocator);
+        slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
+    }
+
+    /// Writes to an R32 target via enhanced barriers or across command lists
+    /// keep its R9G9B9E5 shadow copy in sync with zero D3D12 validation errors.
+    #[test]
+    fn shared_exponent_syncs_across_lists_and_enhanced_barriers() {
+        let Some(host) = host() else { return };
+        let _ = host.log_messages();
+        let words: [u32; 14] = [3, 0, 0, 0, 16, 0, 16, 0x0001_0001, 42, 1, 0, 0, 4, 0];
+        let mut resource = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_at_address(
+                std::ptr::null(),
+                0x10000,
+                words.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &RESOURCE_IID,
+                &mut resource,
+            ),
+            S_OK
+        );
+        let heap: ID3D12DescriptorHeap = unsafe {
+            // SAFETY: plain CPU-only descriptor heap creation.
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let view = View::Shader(resource as usize, Some([67, 4, 5768, 0, 0, 1, 0, 0, 0, 0]));
+        // SAFETY: plain query on live heap.
+        let at = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        assert!(make(&view, at).is_some());
+
+        // 1) Cross-list write -> read without explicit barrier on list 2: prelude syncs.
+        let l1 = host.new_list().unwrap();
+        crate::list::ensure_state(&l1, resource, 8);
+        l1.note_shared_write(resource);
+        l1.close();
+        host.execute(&[&l1]);
+
+        let l2 = host.new_list().unwrap();
+        l2.flush_dirty_shared_exponents();
+        // `prelude` must sync the dirty copy even on an otherwise-empty list.
+        l2.close();
+        host.execute(&[&l2]);
+
+        // 2) Same-list write followed by enhanced barrier / bindless flush.
+        let l3 = host.new_list().unwrap();
+        crate::list::ensure_state(&l3, resource, 8);
+        l3.note_shared_write(resource);
+        l3.flush_dirty_shared_exponents();
+        l3.close();
+        host.execute(&[&l3]);
+
+        let msgs = host.log_messages();
+        assert!(msgs.is_none(), "unexpected D3D12 validation errors: {msgs:?}");
+        // SAFETY: plain removal-reason query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "{msgs:?}");
         slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
     }
 

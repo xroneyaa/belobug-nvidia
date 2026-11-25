@@ -530,6 +530,198 @@ pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
     post
 }
 
+/// Each block's predecessors are rebuilt, irreducible loops split, and
+/// registers renamed, as in [`build`].
+pub(crate) fn rebuild_ssa(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Option<Program> {
+    for block in &mut blocks {
+        block.phis.clear();
+    }
+    link(&mut blocks);
+    split_irreducible(&mut blocks).ok()?;
+    Some(rename(blocks, wave64, vgprs))
+}
+
+fn pure_end(p: &Program, b: usize) -> bool {
+    p.blocks[b].exit == Exit::End
+        && p.blocks[b]
+            .insts
+            .iter()
+            .all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
+}
+
+fn early_out_continuation(block: &Block, ends: impl Fn(usize) -> bool) -> Option<usize> {
+    let Exit::Branch { taken, not_taken } = block.exit else {
+        return None;
+    };
+    match block.insts.last().map(|i| i.name()) {
+        Some("s_cbranch_execz") if ends(taken) => Some(not_taken),
+        Some("s_cbranch_execnz") if ends(not_taken) => Some(taken),
+        _ => None,
+    }
+}
+
+/// The program without early-out branches (`s_cbranch_execz`/`s_cbranch_execnz`
+/// to an `s_endpgm` block): lanes that would have left walk the body with EXEC
+/// clear so every lane of the wave reaches exchanges and barriers. `None` if
+/// nothing changed.
+pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
+    let mut blocks = p.blocks.clone();
+    let mut any = false;
+    for block in &mut blocks {
+        if let Some(cont) = early_out_continuation(block, |b| pure_end(p, b)) {
+            block.insts.pop();
+            block.exit = Exit::Jump(cont);
+            any = true;
+        }
+    }
+    if !any {
+        return None;
+    }
+    rebuild_ssa(blocks, p.wave64, p.vgprs)
+}
+
+/// As [`without_early_outs`], and also removes `s_cbranch_execz` branches
+/// that only skip a pure region when the post-skip code cannot observe any
+/// scalar change inside it (`deep` follows scalar copies and dead phis).
+pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
+    let n = p.blocks.len();
+    let mut copy: std::collections::HashMap<Value, Value> = Default::default();
+    let mut live: std::collections::HashSet<Value> = Default::default();
+    let idle = |inst: &Inst, live: &std::collections::HashSet<Value>| {
+        let name = inst.name();
+        matches!(inst.fields, crate::gfx10::Fields::Sop { .. })
+            && !(name.starts_with("s_setpc")
+                || name.starts_with("s_swappc")
+                || name.starts_with("s_call")
+                || name.starts_with("s_rfe")
+                || name.starts_with("s_movrel")
+                || name.starts_with("s_subvector"))
+            && inst.writes.iter().all(|w| !live.contains(&w.1))
+    };
+    for block in &p.blocks {
+        for inst in &block.insts {
+            if matches!(inst.name(), "s_mov_b32" | "s_mov_b64")
+                && inst.reads.len() == inst.writes.len()
+                && inst
+                    .reads
+                    .iter()
+                    .chain(&inst.writes)
+                    .all(|r| matches!(r.0, Reg::S(_)))
+            {
+                copy.extend(inst.writes.iter().zip(&inst.reads).map(|(w, r)| (w.1, r.1)));
+            }
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &p.blocks {
+            for inst in &block.insts {
+                if !idle(inst, &live) {
+                    for r in &inst.reads {
+                        changed |= live.insert(r.1);
+                    }
+                }
+            }
+            for phi in &block.phis {
+                if live.contains(&phi.value) {
+                    for &a in &phi.args {
+                        changed |= live.insert(a);
+                    }
+                }
+            }
+        }
+    }
+    let root = |mut v: Value| {
+        while deep && let Some(&c) = copy.get(&v) {
+            v = c;
+        }
+        v
+    };
+    let skipped = |b: usize, target: usize, first: usize| -> Option<Vec<bool>> {
+        let mut inside = vec![false; n];
+        let mut stack = vec![first];
+        while let Some(x) = stack.pop() {
+            if x == target || inside[x] {
+                continue;
+            }
+            if x == b {
+                return None;
+            }
+            inside[x] = true;
+            match p.blocks[x].exit {
+                Exit::End | Exit::Indirect => return None,
+                exit => stack.extend(exit.successors()),
+            }
+        }
+        for x in (0..n).filter(|&x| inside[x]) {
+            if p.blocks[x].preds.iter().any(|&q| q != b && !inside[q]) {
+                return None;
+            }
+        }
+        let join = &p.blocks[target];
+        for phi in &join.phis {
+            let scalar = match phi.reg {
+                Reg::S(c) => c != 126 && c != 127,
+                Reg::Scc => true,
+                Reg::V(_) => false,
+            };
+            if !scalar || deep && !live.contains(&phi.value) {
+                continue;
+            }
+            let before: Vec<Value> = join
+                .preds
+                .iter()
+                .zip(&phi.args)
+                .filter(|(q, _)| **q == b)
+                .map(|(_, a)| root(*a))
+                .collect();
+            let within = join
+                .preds
+                .iter()
+                .zip(&phi.args)
+                .filter(|(q, _)| inside[**q])
+                .map(|(_, a)| root(*a));
+            if within.into_iter().any(|a| !before.contains(&a)) {
+                return None;
+            }
+        }
+        if !deep && join.preds.iter().any(|&q| q != b && !inside[q]) {
+            return None;
+        }
+        Some(inside)
+    };
+    let mut blocks = p.blocks.clone();
+    let mut any = false;
+    for (b, block) in p.blocks.iter().enumerate() {
+        if let Some(cont) = early_out_continuation(block, |x| pure_end(p, x)) {
+            blocks[b].insts.pop();
+            blocks[b].exit = Exit::Jump(cont);
+            any = true;
+            continue;
+        }
+        let Exit::Branch { taken, not_taken } = block.exit else {
+            continue;
+        };
+        if !block
+            .insts
+            .last()
+            .is_some_and(|i| i.name() == "s_cbranch_execz")
+        {
+            continue;
+        }
+        if skipped(b, taken, not_taken).is_some() {
+            blocks[b].insts.pop();
+            blocks[b].exit = Exit::Jump(not_taken);
+            any = true;
+        }
+    }
+    if !any {
+        return None;
+    }
+    rebuild_ssa(blocks, p.wave64, p.vgprs)
+}
+
 /// Recomputes every block's predecessors from the exits.
 fn link(blocks: &mut [Block]) {
     for block in blocks.iter_mut() {
