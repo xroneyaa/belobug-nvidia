@@ -54,11 +54,9 @@ impl Drop for Slot {
                 None
             }
         };
-        // Every `Slot` owner (`HostTexture::drop`, `Staging::drop`) already
-        // waits out GPU completion via `crate::host::retire` before dropping the
-        // slot (except a failed `CreatePlacedResource` that never ran on GPU),
-        // so dropping the emptied slab here avoids a redundant retire lag.
-        drop(retired);
+        if let Some(mem) = retired {
+            crate::host::retire(mem);
+        }
     }
 }
 

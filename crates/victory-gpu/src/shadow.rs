@@ -1574,11 +1574,10 @@ fn new_tile() -> Option<Tile> {
     })
 }
 
-/// Drops completely empty full tile heaps back to the OS, keeping one heap of
-/// free tiles unless `pressure` requires releasing every empty heap.
-fn reclaim_empty_tile_heaps(pressure: bool) -> Vec<TileHeap> {
+/// Drops completely empty full tile heaps back to the OS while keeping at
+/// least `keep_reserve` free tiles pooled.
+fn reclaim_empty_tile_heaps(keep_reserve: usize) -> Vec<TileHeap> {
     let mut pool = TILES.lock().unwrap_or_else(|e| e.into_inner());
-    let keep_reserve = if pressure { 0 } else { POOL_TILES as usize };
     let mut free_kept = pool.free.len();
     let mut retired = Vec::new();
     for idx in 0..pool.heaps.len() {
@@ -1626,45 +1625,18 @@ fn sweeps() -> u8 {
 /// Gives back the tiles nothing has asked about for some frames: what
 /// viewed them is gone. At the present of `frame`.
 pub(crate) fn sweep(frame: u64) {
-    sweep_inner(frame, false);
-}
-
-/// Immediately reclaims unmapped title-memory tiles when `VICTORY_SWEEP_TILES >= 2`.
-pub(crate) fn sweep_now() {
-    if sweeps() >= 2 {
-        sweep_inner(crate::queue::presented(), true);
-    }
-}
-
-fn sweep_inner(frame: u64, force: bool) {
+    const EVERY: u64 = 32;
     let mode = sweeps();
-    if mode == 0 {
+    if !frame.is_multiple_of(EVERY) || mode == 0 {
         return;
     }
-    let pressure = crate::host::memory_pressure();
+    // Once a frame, whoever asks.
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if LAST.swap(frame, Ordering::Relaxed) == frame {
+        return;
+    }
     let gone_only = mode >= 2;
-    let every: u64 = if gone_only {
-        if pressure { 2 } else { 8 }
-    } else {
-        32
-    };
-    if !force && !frame.is_multiple_of(every) {
-        return;
-    }
-    if !force {
-        // Once a frame, whoever asks.
-        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if LAST.swap(frame, Ordering::Relaxed) == frame {
-            return;
-        }
-    }
-    let keep: u64 = if gone_only {
-        if pressure { 4 } else { 16 }
-    } else if pressure && !cfg!(test) {
-        32
-    } else {
-        120
-    };
+    let keep: u64 = if gone_only { 600 } else { 120 };
     let mut given = 0u64;
     let started = std::time::Instant::now();
     let all: Vec<Arc<Shadow>> = SPARSE
@@ -1770,8 +1742,8 @@ fn sweep_inner(frame: u64, force: bool) {
             }
         }
     }
-    if given > 0 || pressure {
-        let retired = reclaim_empty_tile_heaps(pressure);
+    if given > 0 {
+        let retired = reclaim_empty_tile_heaps(POOL_TILES as usize);
         if !retired.is_empty() {
             let heaps = retired.len();
             let megabytes = (heaps as u64 * u64::from(POOL_TILES) * PAGE as u64) >> 20;
@@ -2038,30 +2010,44 @@ impl Shadow {
     }
 
     /// Maximum alias buffers per 2 GiB sparse chunk before falling back to
-    /// raw windowing on the root buffer (`VICTORY_MAX_SPARSE_ALIASES`, default 16).
+    /// raw windowing on the root buffer (`VICTORY_MAX_SPARSE_ALIASES`, default 32).
     fn max_sparse_aliases() -> usize {
         static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *MAX.get_or_init(|| {
             std::env::var("VICTORY_MAX_SPARSE_ALIASES")
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(16)
+                .unwrap_or(32)
         })
     }
 
     /// A sparse copy from a start `address` is a multiple of `element` bytes
     /// after.
     fn sparse_on_element(self: &Arc<Self>, address: u64, element: u64) -> Option<Arc<Shadow>> {
-        if element == 0 || (address - self.start) % element == 0 {
+        if element == 0 || (address - self.start).is_multiple_of(element) {
             return Some(self.clone());
         }
         let s = self.sparse.as_ref()?;
+        {
+            let aliases = s.aliases.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(a) = aliases
+                .iter()
+                .find(|a| a.start <= address && (address - a.start).is_multiple_of(element))
+            {
+                return Some(a.clone());
+            }
+            if aliases.len() >= Self::max_sparse_aliases() {
+                return Some(self.clone());
+            }
+        }
         let page = PAGE as u64;
         let mut base = self.start + page;
-        while base <= address && base - self.start <= 16 * page {
-            if (address - base) % element == 0 {
+        while base <= address && base - self.start <= 4096 * page {
+            if (address - base).is_multiple_of(element) {
                 let mut aliases = s.aliases.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(a) = aliases.iter().find(|a| a.start == base) {
+                if let Some(a) = aliases.iter().find(|a| {
+                    a.start == base || (a.start <= address && (address - a.start).is_multiple_of(element))
+                }) {
                     return Some(a.clone());
                 }
                 if aliases.len() >= Self::max_sparse_aliases() {
@@ -2809,7 +2795,7 @@ mod tests {
             }
         }
         crate::memstat::sub(&crate::memstat::SHADOWS, (count * PAGE) as u64);
-        let retired = reclaim_empty_tile_heaps(true);
+        let retired = reclaim_empty_tile_heaps(0);
         assert!(!retired.is_empty(), "expected at least one empty full tile heap to be reclaimed");
         drop(retired);
     }
