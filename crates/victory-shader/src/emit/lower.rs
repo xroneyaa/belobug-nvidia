@@ -193,6 +193,23 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 
 fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    let can_console_cf = !parts.console_cf
+        && !parts.per_lane_only
+        && parts.local_waves == LocalWaves::Off
+        && parts.native.stage == HwStage::Cs
+        && parts.native.wave64
+        && !parts.target.runs(64)
+        && parts.target.runs(32)
+        && matches!(
+            parts.native.io,
+            StageIo::Cs(cs) if cs.threads.iter().product::<u32>() <= 64
+        )
+        && !parts
+            .p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| i.name().starts_with("ds_permute"));
     loop {
         match Lower::new(parts, &bad, numeric_selects).run() {
             Ok(l) => return Ok(l),
@@ -203,6 +220,14 @@ fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, Shader
                         what: "a phi that does not settle",
                     });
                 }
+            }
+            Err(Stop::Fail(ShaderError::Unsupported { what, .. }))
+                if can_console_cf && super::is_wave64_refusal(what) =>
+            {
+                return Err(ShaderError::Unsupported {
+                    offset: 0,
+                    what: CONSOLE_FLOW,
+                });
             }
             Err(Stop::Fail(e)) => return Err(e),
         }
@@ -1995,14 +2020,15 @@ impl<'a> Lower<'a> {
                         exchange = Some((true, vec![true; p.blocks.len()]));
                     }
                 } else {
+                    let has_permute = insts().any(|i| i.name().starts_with("ds_permute"));
                     wants_console_flow = console_lanes
                         && crosses
                         && one_wave
                         && !has_sections
                         && !x.per_lane_only
-                        && !insts().any(|i| i.name().starts_with("ds_permute"));
+                        && !has_permute;
                     if !wants_console_flow
-                        && !insts().any(|i| i.name().starts_with("ds_permute"))
+                        && !has_permute
                         && let Some(all) = all_lane_blocks(p, x.io, x.st, one_wave)
                     {
                         let mut lds_ok = s.lds_dwords == 0
@@ -2024,6 +2050,9 @@ impl<'a> Lower<'a> {
                             }
                             all_blocks = Some(all);
                         }
+                    }
+                    if !split && one_wave && !x.per_lane_only && x.local_waves == LocalWaves::Off && !has_permute {
+                        wants_console_flow = true;
                     }
                 }
             } else {
@@ -13650,8 +13679,13 @@ impl<'a> Lower<'a> {
     /// Console flow: an SCC value as a bit. A mask operation's SCC (result
     /// not zero) is whether some lane of the console wave has its bit.
     fn scc_bit(&mut self, v: Value) -> Result<V, Why> {
-        if let Some(&Val::Bit(x)) = self.vals.get(&v) {
-            return Ok(x);
+        match self.vals.get(&v) {
+            Some(&Val::Bit(x)) => return Ok(x),
+            Some(&Val::Missing(why)) if why != LANE_MASK => return Err(why),
+            _ => {}
+        }
+        if let Some(&lo) = self.mask_scc.get(&v) {
+            return self.mask_any(lo);
         }
         let b = *self
             .def_block

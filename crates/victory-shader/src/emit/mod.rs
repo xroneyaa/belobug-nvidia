@@ -326,7 +326,7 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
     plain
 }
 
-fn is_wave64_refusal(what: &str) -> bool {
+pub(super) fn is_wave64_refusal(what: &str) -> bool {
     what.ends_with("where not every lane runs")
         || matches!(
             what,

@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -364,16 +364,12 @@ impl Shadow {
             Vec<usize>,
             Vec<(usize, usize)>,
             Vec<(usize, Vec<u8>, usize, usize)>,
-            usize,
-            usize,
-        )> = std::sync::Mutex::new((Vec::new(), Vec::new(), Vec::new(), usize::MAX, 0));
+        )> = std::sync::Mutex::new((Vec::new(), Vec::new(), Vec::new()));
         crate::host::in_parallel(&work, 4, |chunk| {
             let mut title_scratch: Option<Vec<u8>> = None;
             let mut local_pages = Vec::new();
             let mut local_dirty = Vec::new();
             let mut local_writes: Vec<(usize, Vec<u8>, usize, usize)> = Vec::new();
-            let mut local_min = usize::MAX;
-            let mut local_max = 0usize;
             for &(off, rb_slice_ptr) in chunk {
                 let n = PAGE.min(shadow_len - off);
                 let title_addr = start + off;
@@ -410,8 +406,6 @@ impl Shadow {
                 for p in page_lo..page_hi {
                     local_pages.push(p);
                 }
-                local_min = local_min.min(title_addr);
-                local_max = local_max.max(title_addr + n);
             }
             if let Some(buf) = title_scratch {
                 give_back(buf);
@@ -421,68 +415,21 @@ impl Shadow {
                 g.0.extend(local_pages);
                 g.1.extend(local_dirty);
                 g.2.extend(local_writes);
-                g.3 = g.3.min(local_min);
-                g.4 = g.4.max(local_max);
             }
         });
-        let (synced_pages, dirty_up, mut dirty_writes, min_addr, max_addr) =
-            merged_sync.into_inner().unwrap();
+        let (synced_pages, dirty_up, dirty_writes) = merged_sync.into_inner().unwrap();
         for (lo, hi) in dirty_up {
             card.mark_dirty(lo, hi);
         }
         let mut written = 0usize;
         if !dirty_writes.is_empty() {
-            dirty_writes.sort_unstable_by_key(|w| w.0);
-            if mode != 1 {
-                let mut span: Option<(usize, usize)> = None;
-                for &(addr, _, dirty_start, dirty_end) in &dirty_writes {
-                    let end = addr + (dirty_end - dirty_start);
-                    match &mut span {
-                        Some((_, e)) if addr <= e.saturating_add(PAGE) => {
-                            *e = (*e).max(end);
-                        }
-                        Some((s, e)) => {
-                            crate::watch::writing(*s, *e - *s);
-                            span = Some((addr, end));
-                        }
-                        None => span = Some((addr, end)),
-                    }
-                }
-                if let Some((s, e)) = span {
-                    crate::watch::writing(s, e - s);
-                }
-            }
-            for (addr, buf, dirty_start, dirty_end) in dirty_writes {
-                let dirty_len = dirty_end - dirty_start;
-                crate::host::write_mapped(
-                    addr as *mut u8,
-                    buf[dirty_start..].as_ptr(),
-                    dirty_len,
-                );
-                written += dirty_len;
-                give_back(buf);
-            }
+            written = flush_title_writes(mode == 1, dirty_writes);
         }
 
-        if !synced_pages.is_empty() && mode != NOT_WATCHED && min_addr < max_addr {
-            let (first, last) = (min_addr.div_ceil(PAGE), max_addr / PAGE);
-            if first < last {
-                let res = if mode == WATCHED_GUARDED {
-                    crate::watch::writes_guarded(first * PAGE, last * PAGE)
-                } else {
-                    crate::watch::writes(first * PAGE, last * PAGE, true)
-                };
-                if let Some((now, _)) = res {
-                    let base = start / PAGE;
-                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    for page in synced_pages {
-                        if let Some(slot) = copied.get_mut(page.wrapping_sub(base)) {
-                            *slot = now;
-                        }
-                    }
-                }
-            }
-        }
+        self.sync_written_pages(mode, synced_pages.into_iter().filter_map(|p| {
+            let page_start = p * PAGE;
+            (page_start >= start && page_start + PAGE <= start + shadow_len).then_some(p)
+        }));
         written
     }
 
@@ -589,6 +536,30 @@ impl Shadow {
     /// submission declares (the world declares overlapping views of its
     /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
     /// ~2.3 million page faults per world frame).
+    /// Like [`Shadow::writing`], over already-collected `[address, address + len)`
+    /// spans of one copy so sparse snapshots lock and dispatch workers once.
+    pub(crate) fn writing_many(&self, ranges: &[(usize, usize)]) {
+        if self.direct.is_some() || ranges.is_empty() {
+            return;
+        }
+        if self.card.is_some() {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            for &(address, len) in ranges {
+                let span = (address, address + len);
+                if !pending.iter().any(|&p| p == span) {
+                    pending.push(span);
+                }
+            }
+            return;
+        }
+        if let Some((root, s)) = self.sparse_root() {
+            return root.sparse_writing_many(s, ranges);
+        }
+        for &(address, len) in ranges {
+            self.writing(address, len);
+        }
+    }
+
     pub(crate) fn writing(&self, address: usize, len: usize) {
         if self.direct.is_some() {
             return;
@@ -777,8 +748,9 @@ impl Shadow {
                 }
             }
 
-            let mut title: Option<Vec<u8>> = None;
-            let mut synced: Vec<(usize, usize, usize)> = Vec::new();
+            let pending_writes: Mutex<Vec<(usize, Vec<u8>, usize, usize)>> = Mutex::new(Vec::new());
+            let mut full_pages: Vec<usize> = Vec::new();
+            let mut dirty_candidates: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
             for (idx, &(at, n, snap_ptr, snap_off, _)) in candidates.iter().enumerate() {
                 if differs[idx] == 0 {
                     let page = (start + at) / PAGE;
@@ -789,77 +761,76 @@ impl Shadow {
                     }
                     continue;
                 }
-                // SAFETY: `self.data + at` and `snap_ptr + snap_off` cover `n` valid bytes.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old =
-                    unsafe { std::slice::from_raw_parts((snap_ptr as *const u8).add(snap_off), n) };
-                let buf = title.get_or_insert_with(|| {
-                    let mut v = pooled(PAGE);
-                    v.resize(PAGE, 0);
-                    v
+                if start + at == ((start + at) / PAGE * PAGE).max(start)
+                    && start + at + n == (((start + at) / PAGE + 1) * PAGE).min(end)
+                {
+                    full_pages.push((start + at) / PAGE);
+                }
+                dirty_candidates.push((at, n, snap_ptr, snap_off, idx));
+            }
+            if !dirty_candidates.is_empty() {
+                let synced_pages: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+                crate::host::in_parallel(&dirty_candidates, 4, |chunk| {
+                    let mut local_scratch: Option<Vec<u8>> = None;
+                    let mut local_dirty: Vec<(usize, Vec<u8>, usize, usize)> = Vec::new();
+                    let mut local_synced: Vec<usize> = Vec::new();
+                    for &(at, n, snap_ptr, snap_off, _) in chunk {
+                        // SAFETY: disjoint 64 KiB slices in `self.data` and `snap_ptr`.
+                        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                        let old = unsafe {
+                            std::slice::from_raw_parts((snap_ptr as *const u8).add(snap_off), n)
+                        };
+                        let mut buf = local_scratch.take().unwrap_or_else(|| pooled(PAGE));
+                        if buf.len() < PAGE {
+                            buf.resize(PAGE, 0);
+                        }
+                        if crate::host::read_into((start + at) as *const u8, &mut buf[..n]) {
+                            if let Some((dirty_start, dirty_end)) =
+                                merge_gpu_writes(&mut buf[..n], host, old)
+                            {
+                                local_dirty.push((
+                                    start + at + dirty_start,
+                                    buf,
+                                    dirty_start,
+                                    dirty_end,
+                                ));
+                            } else {
+                                local_scratch = Some(buf);
+                            }
+                            let page = (start + at) / PAGE;
+                            if start + at == (page * PAGE).max(start)
+                                && start + at + n == ((page + 1) * PAGE).min(end)
+                            {
+                                local_synced.push(page);
+                            }
+                        } else {
+                            local_scratch = Some(buf);
+                        }
+                    }
+                    if let Some(buf) = local_scratch {
+                        give_back(buf);
+                    }
+                    if !local_dirty.is_empty() {
+                        pending_writes
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .extend(local_dirty);
+                    }
+                    if !local_synced.is_empty() {
+                        synced_pages
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .extend(local_synced);
+                    }
                 });
-                let title_slice = &mut buf[..n];
-                if crate::host::read_into((start + at) as *const u8, title_slice) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    if let Some((dirty_start, dirty_end)) = merge_gpu_writes(title_slice, host, old)
-                    {
-                        let dirty_len = dirty_end - dirty_start;
-                        if mode != 1 {
-                            crate::watch::writing(start + at + dirty_start, dirty_len);
-                        }
-                        crate::host::write_mapped(
-                            (start + at + dirty_start) as *mut u8,
-                            title_slice[dirty_start..].as_ptr(),
-                            dirty_len,
-                        );
-                        written += dirty_len;
-                    }
-                    synced.push(((start + at) / PAGE, at, at + n));
+                let synced = synced_pages.into_inner().unwrap();
+                let dirty_writes = pending_writes.into_inner().unwrap();
+                if !dirty_writes.is_empty() {
+                    written = flush_title_writes(mode == 1, dirty_writes);
                 }
+                self.sync_written_pages(mode, synced.into_iter());
             }
-            if let Some(buf) = title {
-                give_back(buf);
-            }
-            if !synced.is_empty() && mode != NOT_WATCHED {
-                // Coalesce `watch::writing` syncs across contiguous pages per span
-                // instead of calling `GetWriteWatch`/`guard` once per chunk.
-                synced.sort_unstable_by_key(|s| s.0);
-                let mut run_first = synced[0].0;
-                let mut run_last = run_first + 1;
-                let flush_sync = |first: usize, last: usize, copied: &mut Vec<u64>| {
-                    if first >= last {
-                        return;
-                    }
-                    let res = if mode == WATCHED_GUARDED {
-                        crate::watch::writes_guarded(first * PAGE, last * PAGE)
-                    } else {
-                        crate::watch::writes(first * PAGE, last * PAGE, true)
-                    };
-                    if let Some((now, _)) = res {
-                        let base = start / PAGE;
-                        for page in first..last {
-                            copied[page - base] = now;
-                        }
-                    }
-                };
-                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for &(page, at, end_at) in &synced {
-                    if start + at > (page * PAGE).max(start)
-                        || start + end_at < ((page + 1) * PAGE).min(end)
-                    {
-                        continue;
-                    }
-                    if page <= run_last {
-                        run_last = run_last.max(page + 1);
-                    } else {
-                        flush_sync(run_first, run_last, &mut copied);
-                        run_first = page;
-                        run_last = page + 1;
-                    }
-                }
-                flush_sync(run_first, run_last, &mut copied);
-            }
+            let _ = full_pages;
         }
         // Every submitted step that declared any of `ranges` is done with them
         // (one submission runs at a time), and the snapshot with the last range.
@@ -1165,7 +1136,7 @@ impl Shadow {
             let mut same = true;
             READ.with_borrow_mut(|read| {
                 if !crate::host::read_into(at as *const u8, &mut read[..n]) {
-                    crate::host::copy_mapped(read.as_mut_ptr(), at as *const u8, n, false);
+                    crate::host::read_sparse_slice(at as *const u8, &mut read[..n]);
                 }
                 let first = at % PAGE;
                 let mut done = 0;
@@ -1280,10 +1251,14 @@ impl Shadow {
 
 /// Windows of title memory the host GPU reads and writes in place, by start:
 /// each a run of committed pages of one allocation.
-static DIRECT: Mutex<BTreeMap<u64, Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+static DIRECT: RwLock<BTreeMap<u64, Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 
-fn windows_of_memory() -> std::sync::MutexGuard<'static, BTreeMap<u64, Arc<Shadow>>> {
-    DIRECT.lock().unwrap_or_else(|e| e.into_inner())
+fn windows_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<u64, Arc<Shadow>>> {
+    DIRECT.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn windows_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<u64, Arc<Shadow>>> {
+    DIRECT.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Buffers of windows gone since (by interface address): views of them are
@@ -1410,7 +1385,7 @@ fn run_of(from: u64, to: u64) -> Option<(u64, u64)> {
 
 /// Whether `[address, end)` lies in a window made already.
 pub(crate) fn in_place(address: u64, end: u64) -> bool {
-    windows_of_memory()
+    windows_read()
         .range(..=address)
         .rev()
         .take(8)
@@ -1439,7 +1414,31 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
         device
     });
     let device = device.as_ref()?;
-    let mut map = windows_of_memory();
+    {
+        let map = windows_read();
+        if let Some(s) = map
+            .range(..=address)
+            .rev()
+            .take(8)
+            .map(|(_, s)| s)
+            .find(|s| s.start + s.len >= end)
+        {
+            return Some(s.clone());
+        }
+    }
+    // Asked over and over for the same memory: not looked at each time.
+    static REFUSED: Mutex<BTreeMap<u64, (u64, u64)>> = Mutex::new(BTreeMap::new());
+    let frame = crate::queue::presented();
+    {
+        let refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(e, f)) = refused.get(&address)
+            && e == end
+            && f + 30 > frame
+        {
+            return None;
+        }
+    }
+    let mut map = windows_write();
     if let Some(s) = map
         .range(..=address)
         .rev()
@@ -1449,9 +1448,6 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
     {
         return Some(s.clone());
     }
-    // Asked over and over for the same memory: not looked at each time.
-    static REFUSED: Mutex<BTreeMap<u64, (u64, u64)>> = Mutex::new(BTreeMap::new());
-    let frame = crate::queue::presented();
     let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&(e, f)) = refused.get(&address)
         && e == end
@@ -1540,7 +1536,7 @@ fn region_state(address: usize) -> (bool, usize) {
 /// Tiles of `[start, end)` known to have no title memory are looked at again.
 pub(crate) fn filled(start: u64, end: u64) {
     let over: Vec<Arc<Shadow>> = SPARSE
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .filter(|(chunk, _)| *chunk * CHUNK < end && start < (*chunk + 1) * CHUNK)
@@ -1577,7 +1573,7 @@ pub(crate) fn remapped(start: u64, end: u64) {
     use windows::core::Interface;
     filled(start, end);
     crate::memory::remapped(start, end);
-    let mut map = windows_of_memory();
+    let mut map = windows_write();
     if map.is_empty() {
         return;
     }
@@ -1957,7 +1953,7 @@ pub(crate) fn sweep(frame: u64) {
     let mut given = 0u64;
     let started = std::time::Instant::now();
     let mut all: Vec<Arc<Shadow>> = SPARSE
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .values()
         .flatten()
@@ -2154,7 +2150,7 @@ fn buffer_desc(
 }
 
 /// Sparse copies by chunk.
-static SPARSE: Mutex<BTreeMap<u64, Option<Arc<Shadow>>>> = Mutex::new(BTreeMap::new());
+static SPARSE: RwLock<BTreeMap<u64, Option<Arc<Shadow>>>> = RwLock::new(BTreeMap::new());
 
 fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow> {
     use windows::Win32::Graphics::Direct3D12::*;
@@ -2207,11 +2203,15 @@ fn sparse(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if cfg!(test) || (end - 1) / CHUNK != address / CHUNK {
         return None;
     }
+    let chunk = address / CHUNK;
+    if let Some(hit) = SPARSE.read().unwrap_or_else(|e| e.into_inner()).get(&chunk) {
+        return hit.clone();
+    }
     SPARSE
-        .lock()
+        .write()
         .unwrap_or_else(|e| e.into_inner())
-        .entry(address / CHUNK)
-        .or_insert_with(|| sparse_buffer(address / CHUNK * CHUNK, CHUNK, None).map(Arc::new))
+        .entry(chunk)
+        .or_insert_with(|| sparse_buffer(chunk * CHUNK, CHUNK, None).map(Arc::new))
         .clone()
 }
 
@@ -2223,7 +2223,7 @@ pub(crate) fn chunk(address: u64) -> Option<Arc<Shadow>> {
 /// Shaders run by `list` reach the memory at `address` (and `len` bytes
 /// after it, more or less) by its address.
 pub(crate) fn declare(list: &HostList, address: u64, len: u64) {
-    if address >> 40 != 0 || address < 1 << 20 {
+    if address >> 40 != 0 || address < 1 << 20 || !list.mark_declared(address, len) {
         return;
     }
     let Some(s) = find_reaching(address, 1) else { return };
@@ -2454,39 +2454,101 @@ impl Shadow {
         views
     }
 
-    /// [`Shadow::writing`] of a sparse copy. A range inside one already
-    /// declared for this submission has its tiles' snapshots taken; new
-    /// snapshots are copied on several threads (hundreds of MB a frame).
+    /// [`Shadow::writing`] of a sparse copy. Spans inside intervals already
+    /// declared for this submission avoid taking locks over tiles that already
+    /// hold a snapshot; missing tiles are copied across worker threads.
     fn sparse_writing(&self, s: &Sparse, address: usize, len: usize) {
-        let end = address + len;
-        let covered = {
+        self.sparse_writing_many(s, &[(address, len)]);
+    }
+
+    fn sparse_writing_many(&self, s: &Sparse, ranges: &[(usize, usize)]) {
+        let mut take = Vec::new();
+        {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            let covered = pending.iter().any(|&(a, b)| a <= address && end <= b);
-            pending.push((address, end));
-            covered
-        };
-        #[cfg(feature = "diagnostics")]
-        SPARSE_WRITES[0].fetch_add(len as u64, Ordering::Relaxed);
-        if covered {
+            for &(address, len) in ranges {
+                let end = address + len;
+                #[cfg(feature = "diagnostics")]
+                SPARSE_WRITES[0].fetch_add(len as u64, Ordering::Relaxed);
+                let covered = pending.iter().any(|&(a, b)| a <= address && end <= b);
+                if !covered || !pending.iter().any(|&p| p == (address, end)) {
+                    pending.push((address, end));
+                }
+                if !covered {
+                    take.push((address, end));
+                }
+            }
+        }
+        if take.is_empty() {
             return;
         }
-        let views = self.tiles_of(s, address, end);
-        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
         let start = self.start as usize;
-        // (tile, the start of its view) of tiles without a snapshot yet.
-        let new: Vec<(u32, usize)> = views
-            .iter()
-            .map(|&(at, data, _)| (((at - start) / PAGE) as u32, data & !(PAGE - 1)))
-            .filter(|(tile, _)| !before.contains_key(tile))
+        let end_bound = start + self.len as usize;
+        let mut span_indices: Vec<(usize, usize)> = take
+            .into_iter()
+            .filter_map(|(a, b)| {
+                let lo = a.clamp(start, end_bound);
+                let hi = b.clamp(lo, end_bound);
+                (lo < hi).then_some((lo - start, hi - start))
+            })
             .collect();
-        if new.is_empty() {
+        if span_indices.is_empty() {
+            return;
+        }
+        span_indices.sort_unstable();
+        let mut merged_tiles: Vec<(u32, u32)> = Vec::with_capacity(span_indices.len());
+        for (lo, hi) in span_indices {
+            let t0 = (lo / PAGE) as u32;
+            let t1 = ((hi - 1) / PAGE) as u32;
+            if let Some((_, prev_hi)) = merged_tiles.last_mut()
+                && t0 <= prev_hi.saturating_add(1)
+            {
+                *prev_hi = (*prev_hi).max(t1);
+            } else {
+                merged_tiles.push((t0, t1));
+            }
+        }
+        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut missing_tiles: Vec<u32> = Vec::new();
+        for (t0, t1) in merged_tiles {
+            for tile in t0..=t1 {
+                if !before.contains_key(&tile) {
+                    missing_tiles.push(tile);
+                }
+            }
+        }
+        if missing_tiles.is_empty() {
+            return;
+        }
+        let mut resolved: Vec<(u32, usize)> = Vec::with_capacity(missing_tiles.len());
+        let mut unmapped: Vec<u32> = Vec::new();
+        {
+            let mut tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
+            let frame = crate::queue::presented();
+            for tile in missing_tiles {
+                if let Some(t) = tiles.get_mut(&tile) {
+                    t.used = frame;
+                    resolved.push((tile, t.data));
+                } else {
+                    unmapped.push(tile);
+                }
+            }
+        }
+        for tile in unmapped {
+            if let Some(data) = self.tile(s, start + tile as usize * PAGE) {
+                resolved.push((tile, data & !(PAGE - 1)));
+            }
+        }
+        if resolved.is_empty() {
             return;
         }
         #[cfg(feature = "diagnostics")]
-        SPARSE_WRITES[1].fetch_add((new.len() * PAGE) as u64, Ordering::Relaxed);
-        let mut bufs = pooled_tiles(new.len());
-        let copies: Vec<(usize, usize)> =
-            new.iter().zip(&mut bufs).map(|(&(_, view), buf)| (view, buf.as_mut_ptr() as usize)).collect();
+        SPARSE_WRITES[1].fetch_add((resolved.len() * PAGE) as u64, Ordering::Relaxed);
+        let mut bufs = pooled_tiles(resolved.len());
+        let copies: Vec<(usize, usize)> = resolved
+            .iter()
+            .zip(&mut bufs)
+            .map(|(&(_, view), buf)| (view, buf.as_mut_ptr() as usize))
+            .collect();
         crate::host::in_parallel(&copies, 16, |chunk| {
             for &(view, buf) in chunk {
                 // SAFETY: the tile's mapping; a buffer with room for a tile,
@@ -2494,7 +2556,7 @@ impl Shadow {
                 unsafe { std::ptr::copy_nonoverlapping(view as *const u8, buf as *mut u8, PAGE) };
             }
         });
-        for (&(tile, _), mut buf) in new.iter().zip(bufs) {
+        for (&(tile, _), mut buf) in resolved.iter().zip(bufs) {
             // SAFETY: filled above, within its capacity.
             unsafe { buf.set_len(PAGE) };
             before.insert(tile, buf);
@@ -2567,40 +2629,12 @@ impl Shadow {
                     .extend(local_dirty);
             }
         });
-        let mut dirty_writes = pending_writes.into_inner().unwrap_or_else(|e| e.into_inner());
-        let mut written = 0usize;
-        if !dirty_writes.is_empty() {
-            dirty_writes.sort_unstable_by_key(|w| w.0);
-            // Coalesce contiguous/overlapping title spans up to 64 KiB block boundaries
-            // so `watch::writing` opens and pins each span once instead of per-tile.
-            let mut span: Option<(usize, usize)> = None;
-            for &(addr, _, dirty_start, dirty_end) in &dirty_writes {
-                let end = addr + (dirty_end - dirty_start);
-                match &mut span {
-                    Some((s, e)) if addr <= e.saturating_add(PAGE) => {
-                        *e = (*e).max(end);
-                    }
-                    Some((s, e)) => {
-                        crate::watch::writing(*s, *e - *s);
-                        span = Some((addr, end));
-                    }
-                    None => span = Some((addr, end)),
-                }
-            }
-            if let Some((s, e)) = span {
-                crate::watch::writing(s, e - s);
-            }
-            for (addr, buf, dirty_start, dirty_end) in dirty_writes {
-                let dirty_len = dirty_end - dirty_start;
-                crate::host::write_mapped(
-                    addr as *mut u8,
-                    buf[dirty_start..].as_ptr(),
-                    dirty_len,
-                );
-                written += dirty_len;
-                give_back(buf);
-            }
-        }
+        let dirty_writes = pending_writes.into_inner().unwrap_or_else(|e| e.into_inner());
+        let written = if !dirty_writes.is_empty() {
+            flush_title_writes(false, dirty_writes)
+        } else {
+            0
+        };
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| !ranges.iter().any(|&(a, l)| r == (a, a.saturating_add(l))));
         if pending.is_empty() {
@@ -2608,45 +2642,166 @@ impl Shadow {
         }
         written
     }
+
+    /// Coalesces contiguous synced `PAGE` indices and refreshes write-watch/guard
+    /// timestamps once per run instead of per-chunk or across wide un-synced gaps.
+    fn sync_written_pages(&self, mode: u8, pages: impl Iterator<Item = usize>) {
+        if mode == NOT_WATCHED {
+            return;
+        }
+        let mut pages: Vec<usize> = pages.collect();
+        if pages.is_empty() {
+            return;
+        }
+        pages.sort_unstable();
+        pages.dedup();
+        let base = self.start as usize / PAGE;
+        let flush_sync = |first: usize, last: usize, copied: &mut Vec<u64>| {
+            if first >= last {
+                return;
+            }
+            let res = if mode == WATCHED_GUARDED {
+                crate::watch::writes_guarded(first * PAGE, last * PAGE)
+            } else {
+                crate::watch::writes(first * PAGE, last * PAGE, true)
+            };
+            if let Some((now, _)) = res {
+                for page in first..last {
+                    if let Some(slot) = copied.get_mut(page.wrapping_sub(base)) {
+                        *slot = now;
+                    }
+                }
+            }
+        };
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let mut run_first = pages[0];
+        let mut run_last = run_first + 1;
+        for &page in &pages[1..] {
+            if page <= run_last {
+                run_last = run_last.max(page + 1);
+            } else {
+                flush_sync(run_first, run_last, &mut copied);
+                run_first = page;
+                run_last = page + 1;
+            }
+        }
+        flush_sync(run_first, run_last, &mut copied);
+    }
 }
 
-/// Merges bytes the GPU changed (`host != old`) into `title`, syncs `host` to
-/// `title`, and returns the tight `[first, last)` byte span where `title` was
-/// modified (or `None` if nothing changed). Scans 8 bytes at a time so
-/// unchanged 64-bit words skip per-byte branching.
-fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Option<(usize, usize)> {
-    let n = title.len().min(host.len()).min(old.len());
+/// Coalesces `watch::writing` notifications across near-contiguous title writes,
+/// copies the merged bytes back into title memory, and returns buffers to [`POOL`].
+fn flush_title_writes(
+    skip_watch: bool,
+    mut dirty_writes: Vec<(usize, Vec<u8>, usize, usize)>,
+) -> usize {
+    dirty_writes.sort_unstable_by_key(|w| w.0);
+    if !skip_watch {
+        let mut span: Option<(usize, usize)> = None;
+        for &(addr, _, dirty_start, dirty_end) in &dirty_writes {
+            let end = addr + (dirty_end - dirty_start);
+            match &mut span {
+                Some((_, e)) if addr <= e.saturating_add(PAGE) => {
+                    *e = (*e).max(end);
+                }
+                Some((s, e)) => {
+                    crate::watch::writing(*s, *e - *s);
+                    span = Some((addr, end));
+                }
+                None => span = Some((addr, end)),
+            }
+        }
+        if let Some((s, e)) = span {
+            crate::watch::writing(s, e - s);
+        }
+    }
+    let mut written = 0usize;
+    for (addr, buf, dirty_start, dirty_end) in dirty_writes {
+        let dirty_len = dirty_end - dirty_start;
+        crate::host::write_mapped(addr as *mut u8, buf[dirty_start..].as_ptr(), dirty_len);
+        written += dirty_len;
+        give_back(buf);
+    }
+    written
+}
+
+enum OldSlice<'a> {
+    Ro(&'a [u8]),
+    Rw(&'a mut [u8]),
+}
+
+impl OldSlice<'_> {
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        match self {
+            OldSlice::Ro(b) => b,
+            OldSlice::Rw(b) => b,
+        }
+    }
+}
+
+/// Merges GPU writes into `title` and keeps `host` synchronized, optionally
+/// updating `old`. Unchanged words (`hw == ow && tw == ow`) perform zero writes
+/// to `host` (`WRITE_BACK` shared heap) or `old`.
+fn merge_gpu_writes_inner(
+    title: &mut [u8],
+    host: &mut [u8],
+    mut old: OldSlice<'_>,
+) -> Option<(usize, usize)> {
+    let n = title.len().min(host.len()).min(old.bytes().len());
     let mut first = usize::MAX;
     let mut last = 0usize;
     let mut i = 0;
     while i + 8 <= n {
         let hw = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
-        let ow = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
+        let ow = u64::from_ne_bytes(old.bytes()[i..i + 8].try_into().unwrap());
         if hw == ow {
-            host[i..i + 8].copy_from_slice(&title[i..i + 8]);
+            let tw = u64::from_ne_bytes(title[i..i + 8].try_into().unwrap());
+            if tw != ow {
+                let bytes = &title[i..i + 8];
+                host[i..i + 8].copy_from_slice(bytes);
+                if let OldSlice::Rw(w) = &mut old {
+                    w[i..i + 8].copy_from_slice(bytes);
+                }
+            }
         } else {
             for k in i..i + 8 {
                 let h = host[k];
-                if h != old[k] && title[k] != h {
+                if h != old.bytes()[k] && title[k] != h {
                     title[k] = h;
                     first = first.min(k);
                     last = k + 1;
                 }
-                host[k] = title[k];
+                let t = title[k];
+                host[k] = t;
+                if let OldSlice::Rw(w) = &mut old {
+                    w[k] = t;
+                }
             }
         }
         i += 8;
     }
     for k in i..n {
         let h = host[k];
-        if h != old[k] && title[k] != h {
+        if h != old.bytes()[k] && title[k] != h {
             title[k] = h;
             first = first.min(k);
             last = k + 1;
         }
-        host[k] = title[k];
+        let t = title[k];
+        host[k] = t;
+        if let OldSlice::Rw(w) = &mut old {
+            w[k] = t;
+        }
     }
     (first < last).then_some((first, last))
+}
+
+/// Merges bytes the GPU changed (`host != old`) into `title`, syncs `host` to
+/// `title`, and returns the tight `[first, last)` byte span where `title` was
+/// modified (or `None` if nothing changed).
+fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Option<(usize, usize)> {
+    merge_gpu_writes_inner(title, host, OldSlice::Ro(old))
 }
 
 /// Same as [`merge_gpu_writes`], also updating `old` to match `title`.
@@ -2655,44 +2810,7 @@ fn merge_gpu_writes_mut(
     host: &mut [u8],
     old: &mut [u8],
 ) -> Option<(usize, usize)> {
-    let n = title.len().min(host.len()).min(old.len());
-    let mut first = usize::MAX;
-    let mut last = 0usize;
-    let mut i = 0;
-    while i + 8 <= n {
-        let hw = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
-        let ow = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
-        if hw == ow {
-            let tw = &title[i..i + 8];
-            host[i..i + 8].copy_from_slice(tw);
-            old[i..i + 8].copy_from_slice(tw);
-        } else {
-            for k in i..i + 8 {
-                let h = host[k];
-                if h != old[k] && title[k] != h {
-                    title[k] = h;
-                    first = first.min(k);
-                    last = k + 1;
-                }
-                let t = title[k];
-                host[k] = t;
-                old[k] = t;
-            }
-        }
-        i += 8;
-    }
-    for k in i..n {
-        let h = host[k];
-        if h != old[k] && title[k] != h {
-            title[k] = h;
-            first = first.min(k);
-            last = k + 1;
-        }
-        let t = title[k];
-        host[k] = t;
-        old[k] = t;
-    }
-    (first < last).then_some((first, last))
+    merge_gpu_writes_inner(title, host, OldSlice::Rw(old))
 }
 
 /// Merges GPU-modified bytes (`gpu_new != staging_old`) into `title` and syncs
@@ -2761,15 +2879,19 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+static BUFFERS: RwLock<BTreeMap<(u64, usize), Entry>> = RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn buffers_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    buffers_write().insert(
         (start, resource),
         Entry {
             end: start + len,
@@ -2780,7 +2902,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    let gone = buffers().remove(&(start, resource));
+    let gone = buffers_write().remove(&(start, resource));
     if let Some(shadow) = gone.and_then(|e| e.shadow) {
         crate::host::retire(shadow);
     }
@@ -2792,7 +2914,7 @@ pub(crate) fn in_buffer(address: u64, len: u64) -> bool {
     let Some(end) = address.checked_add(len.max(1)) else {
         return false;
     };
-    buffers()
+    buffers_read()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -2817,23 +2939,31 @@ fn find_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if let Some(copy) = sparse(address, end) {
         return Some(copy);
     }
-    let mut map = buffers();
-    let holding: Vec<((u64, usize), bool)> = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .filter(|(_, e)| e.end >= end)
-        .map(|(k, e)| (*k, e.shadow.is_some()))
-        .collect();
-    let key = holding
-        .iter()
-        .find(|(_, made)| *made)
-        .or(holding.first())
-        .map(|(k, _)| *k);
+    let key = {
+        let map = buffers_read();
+        let mut first_hit: Option<(u64, usize)> = None;
+        for (k, e) in map.range(..=(address, usize::MAX)).rev().take(64) {
+            if e.end >= end {
+                if let Some(shadow) = &e.shadow {
+                    return Some(shadow.clone());
+                }
+                first_hit.get_or_insert(*k);
+            }
+        }
+        first_hit
+    };
     let Some(key) = key else {
-        drop(map);
         return loose(address, end);
     };
+    let mut map = buffers_write();
+    // Re-check under write lock in case a concurrent thread created a containing shadow.
+    for (_, e) in map.range(..=(address, usize::MAX)).rev().take(64) {
+        if e.end >= end
+            && let Some(shadow) = &e.shadow
+        {
+            return Some(shadow.clone());
+        }
+    }
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
@@ -2885,7 +3015,7 @@ fn find_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
 pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
     // To the end of the innermost buffer holding it: a window ending sooner
     // faults.
-    let end = buffers()
+    let end = buffers_read()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -2908,7 +3038,7 @@ pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
 const WINDOW: u64 = 4 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(copy) = sparse(address, end) {
@@ -2916,7 +3046,19 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     }
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = map
+            .range(..=(start, u64::MAX))
+            .rev()
+            .take(64)
+            .find(|((s, l), _)| *s <= address && s + l >= end)
+            .map(|(_, shadow)| shadow.clone())
+        {
+            return Some(shadow);
+        }
+    }
+    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     // Any window copied already that holds the range: a range crossing a
     // window's end used to get a second copy of the same bytes.
     if let Some(shadow) = map
@@ -2959,25 +3101,25 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_read()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
     all.extend(
         LOOSE
-            .lock()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
     );
-    for s in SPARSE.lock().unwrap_or_else(|e| e.into_inner()).values().flatten() {
+    for s in SPARSE.read().unwrap_or_else(|e| e.into_inner()).values().flatten() {
         all.push((s.gpu, s.start, s.len));
         if let Some(sparse) = &s.sparse {
             let aliases = sparse.aliases.lock().unwrap_or_else(|e| e.into_inner());
             all.extend(aliases.iter().map(|a| (a.gpu, a.start, a.len)));
         }
     }
-    all.extend(windows_of_memory().values().map(|s| (s.gpu, s.start, s.len)));
+    all.extend(windows_read().values().map(|s| (s.gpu, s.start, s.len)));
     let below = all.iter().filter(|c| c.0 <= va).max();
     let above = all.iter().filter(|c| c.0 > va).min();
     let mut text = match below {

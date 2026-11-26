@@ -992,6 +992,10 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Buffer ranges declared written by shaders in this list.
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    /// `(address, len)` spans already passed to `shadow::declare` since `defer_copy`.
+    declared: std::collections::HashSet<(u64, u64)>,
     /// View heaps the list's draws index directly (`ResourceDescriptorHeap[]`),
     /// and whether any of their shaders may write memory: their slots are
     /// brought up to date once per submission, after every other step.
@@ -1359,34 +1363,44 @@ impl Host {
         let first = early.record(self);
         // Deduplicate GPU write ranges once before execution so VRAM card
         // shadows get pre-uploaded / Wave64-hashed in the same GPU wait.
+        let mut card_seen = std::collections::HashSet::<(usize, usize, usize)>::new();
+        let mut cpu_seen = std::collections::HashSet::<(usize, usize, usize)>::new();
         let mut card_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
             Vec::new();
         let mut cpu_back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step {
-                    let target = if shadow.is_card() {
-                        &mut card_writes
+                    let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
+                    let inserted = if shadow.is_card() {
+                        card_seen.insert(key)
                     } else {
-                        &mut cpu_back
+                        cpu_seen.insert(key)
                     };
-                    if !target.iter().any(|(s, a, l)| {
-                        std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
-                    }) {
+                    if inserted {
+                        let target = if shadow.is_card() {
+                            &mut card_writes
+                        } else {
+                            &mut cpu_back
+                        };
                         target.push((shadow.clone(), *address, *len));
                     }
                 }
             }
         }
         for (shadow, address, len) in batch.bindless_writes.drain(..) {
-            let target = if shadow.is_card() {
-                &mut card_writes
+            let key = (std::sync::Arc::as_ptr(&shadow) as usize, address, len);
+            let inserted = if shadow.is_card() {
+                card_seen.insert(key)
             } else {
-                &mut cpu_back
+                cpu_seen.insert(key)
             };
-            if !target.iter().any(|(s, a, l)| {
-                std::sync::Arc::ptr_eq(s, &shadow) && (*a, *l) == (address, len)
-            }) {
+            if inserted {
+                let target = if shadow.is_card() {
+                    &mut card_writes
+                } else {
+                    &mut cpu_back
+                };
                 target.push((shadow, address, len));
             }
         }
@@ -2883,6 +2897,13 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.declared.clear();
+    }
+
+    /// Marks `(address, len)` as declared on this command list since the last
+    /// title copy; returns false if already declared.
+    pub(crate) fn mark_declared(&self, address: u64, len: u64) -> bool {
+        self.deferred().declared.insert((address, len))
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -2919,7 +2940,12 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
+        let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+        let mut deferred = self.deferred();
+        if !deferred.gpu_written.insert((ptr, address, len)) {
+            return;
+        }
+        deferred
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
@@ -3350,9 +3376,36 @@ impl HostList {
         let mut refresh_count = 0u64;
         #[cfg(feature = "diagnostics")]
         let mut refresh_bytes = 0u64;
+        let flush_gpu_writes =
+            |batch: &mut Batch,
+             pending: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>| {
+                if pending.is_empty() {
+                    return;
+                }
+                let writes = std::mem::take(pending);
+                let mut grouped: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
+                    Vec::new();
+                for (shadow, address, len) in writes {
+                    batch.flush_shadow_range(&shadow, address, address.saturating_add(len));
+                    if let Some(entry) = grouped
+                        .iter_mut()
+                        .find(|(s, _)| std::sync::Arc::ptr_eq(s, &shadow))
+                    {
+                        entry.1.push((address, len));
+                    } else {
+                        grouped.push((shadow, vec![(address, len)]));
+                    }
+                }
+                for (shadow, spans) in grouped {
+                    let merged = crate::shadow::Shadow::merge_back_ranges(&spans);
+                    shadow.writing_many(&merged);
+                }
+            };
+        let mut pending_gpu_writes = Vec::new();
         for step in &deferred.copies {
             match step {
                 &Step::Copy(dst, src, len) => {
+                    flush_gpu_writes(batch, &mut pending_gpu_writes);
                     flush_textures(&mut pending_textures, &mut uploads);
                     #[cfg(feature = "diagnostics")]
                     {
@@ -3365,6 +3418,7 @@ impl HostList {
                     copy_bytes += len as u64;
                 }
                 &Step::Fill(dst, src, len) => {
+                    flush_gpu_writes(batch, &mut pending_gpu_writes);
                     #[cfg(feature = "diagnostics")]
                     {
                         copy_count += 1;
@@ -3375,6 +3429,7 @@ impl HostList {
                     copy_bytes += len as u64;
                 }
                 Step::Refresh(shadow, address, len) => {
+                    flush_gpu_writes(batch, &mut pending_gpu_writes);
                     #[cfg(feature = "diagnostics")]
                     {
                         refresh_count += 1;
@@ -3383,6 +3438,7 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                 }
                 Step::Run(work) | Step::Host(work) => {
+                    flush_gpu_writes(batch, &mut pending_gpu_writes);
                     flush_textures(&mut pending_textures, &mut uploads);
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
@@ -3397,17 +3453,17 @@ impl HostList {
                     }
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data.
-                    batch.flush();
-                    shadow.writing(*address, *len);
+                    pending_gpu_writes.push((shadow.clone(), *address, *len));
                 }
                 Step::Texture(staging, copy) => {
+                    flush_gpu_writes(batch, &mut pending_gpu_writes);
                     if batch.texture_due(staging) {
                         pending_textures.push((staging.clone(), copy.clone()));
                     }
                 }
             }
         }
+        flush_gpu_writes(batch, &mut pending_gpu_writes);
         flush_textures(&mut pending_textures, &mut uploads);
         if copy_bytes > 0 || copy_us > 0 {
             PREPARING[0].fetch_add(copy_us, Ordering::Relaxed);
@@ -3485,6 +3541,58 @@ impl Batch {
         {
             Some((_, w)) => *w |= writes,
             None => self.bindless.push((heap.clone(), writes)),
+        }
+    }
+
+    /// Flushes only queued refreshes overlapping `[address, end)` on `shadow`,
+    /// leaving non-overlapping refreshes of this submission batched across lists.
+    fn flush_shadow_range(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        end: usize,
+    ) {
+        if end <= address {
+            return;
+        }
+        if shadow.is_sparse() {
+            let root = shadow.root_key();
+            let mut matched = Vec::new();
+            let mut i = 0;
+            while i < self.pieces.len() {
+                let (ref s, from, to) = self.pieces[i];
+                if s.root_key() == root && from < end && to > address {
+                    matched.push(self.pieces.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            if !matched.is_empty() {
+                matched.sort_unstable_by_key(|&(_, from, _)| from);
+                let mut from = matched[0].1;
+                let mut to = matched[0].2;
+                for &(_, a, b) in &matched[1..] {
+                    if a <= to + 4096 {
+                        to = to.max(b);
+                    } else {
+                        update(shadow, from, to - from);
+                        from = a;
+                        to = b;
+                    }
+                }
+                update(shadow, from, to - from);
+            }
+            return;
+        }
+        let mut i = 0;
+        while i < self.refreshes.len() {
+            let (ref s, from, to) = self.refreshes[i];
+            if std::sync::Arc::ptr_eq(s, shadow) && from < end && to > address {
+                let (s, from, to) = self.refreshes.swap_remove(i);
+                update(&s, from, to - from);
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -3583,27 +3691,34 @@ impl Batch {
     fn prepare_bindless(&mut self) {
         self.flush();
         crate::watch::ask_once_end();
-        for (heap, writes) in std::mem::take(&mut self.bindless) {
+        let entries = std::mem::take(&mut self.bindless);
+        let mut built: Vec<(std::sync::Arc<crate::descriptor::host::BindlessPlan>, bool)> =
+            Vec::with_capacity(entries.len());
+        let mut ahead_ranges: Vec<(usize, usize)> = Vec::new();
+        for (heap, writes) in entries {
             let started = std::time::Instant::now();
             let plan = heap.bindless_plan();
             BINDLESS_US[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            let Some(plan) = plan else {
-                continue;
-            };
-            let (reads, all) = plan.copy_constants();
-            if !reads.is_empty() {
-                let mut total_bytes = 0usize;
-                let mut ahead_ranges: Vec<(usize, usize)> = Vec::new();
+            if let Some(plan) = plan {
+                let (reads, _) = plan.copy_constants();
                 for (shadow, address, len) in reads {
-                    total_bytes = total_bytes.saturating_add(*len);
                     if shadow.kernel_watched() && *len > 0 {
                         ahead_ranges.push((*address, address.saturating_add(*len)));
                     }
                 }
-                let ahead = !ahead_ranges.is_empty();
-                if ahead {
-                    crate::watch::ask_ahead(&ahead_ranges);
-                }
+                built.push((plan, writes));
+            }
+        }
+        let ahead = !ahead_ranges.is_empty();
+        if ahead {
+            crate::watch::ask_ahead(&ahead_ranges);
+        }
+        for (plan, writes) in built {
+            let (reads, all) = plan.copy_constants();
+            if !reads.is_empty() {
+                let total_bytes: usize = reads
+                    .iter()
+                    .fold(0usize, |acc, (_, _, len)| acc.saturating_add(*len));
                 let started = std::time::Instant::now();
                 let copied = std::sync::atomic::AtomicU64::new(0);
                 if reads.len() > 1 && total_bytes >= (256 << 10) {
@@ -3633,9 +3748,6 @@ impl Batch {
                 }
                 PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
                 PREPARING[1].fetch_add(copied.into_inner(), Ordering::Relaxed);
-                if ahead {
-                    crate::watch::ask_ahead_done();
-                }
             }
             // shortcut: what shaders write through directly indexed slots into
             // copied memory stays in the copy (title memory used in place
@@ -3651,6 +3763,9 @@ impl Batch {
                 }
             }
             self.plans.push(plan);
+        }
+        if ahead {
+            crate::watch::ask_ahead_done();
         }
     }
 }
@@ -4217,10 +4332,21 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
+/// Copies `[0..dst.len()]` from `src` into host buffer `dst`, skipping unmapped
+/// source regions via `VirtualQuery` without double-faulting when `read_into`
+/// already failed.
+pub(crate) fn read_sparse_slice(src: *const u8, dst: &mut [u8]) {
+    read_sparse(src, dst.as_mut_ptr(), dst.len());
+}
+
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, PAGE_WRITECOPY,
+        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, VirtualQuery,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
@@ -4234,6 +4360,38 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
     if len == 0 || write(dst as usize, len) {
+        return;
+    }
+    if len >= 64 << 10 {
+        let mut offset = 0usize;
+        while offset < len {
+            let at = dst.wrapping_add(offset);
+            let remaining = len - offset;
+            // SAFETY: local `MEMORY_BASIC_INFORMATION` out pointer.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
+            let n = (info.BaseAddress as usize)
+                .saturating_add(info.RegionSize)
+                .saturating_sub(at as usize)
+                .min(remaining);
+            if size != size_of_val(&info) || n == 0 {
+                for_pieces(at as usize, remaining, 4 << 10, |a, k| {
+                    write(a, k);
+                });
+                break;
+            }
+            let writable = info.State == MEM_COMMIT
+                && matches!(
+                    info.Protect & 0xff,
+                    PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+                );
+            if writable && !write(at as usize, n) {
+                for_pieces(at as usize, n, 4 << 10, |a, k| {
+                    write(a, k);
+                });
+            }
+            offset += n;
+        }
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {

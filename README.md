@@ -20,18 +20,25 @@ intact.
 | Area | Current state |
 |------|---------------|
 | Target adapters | NVIDIA RTX 3060 Ti 8 GB (Wave32 `32-32`, capped descriptor heap fallback); prior base also ran on AMD RX 9070 XT 16 GB (Wave64) |
-| Shader translation (Wave32 `32-32`) | **25,599 / 25,889** programs emit DXIL across 26,503 containers in the shader archive (614 duplicates skipped; 290 unsupported, `14,246 / 14,247` VP) |
+| Shader translation (Wave32 `32-32`) | **25,617 / 25,889** unique programs emit DXIL and pass `dxil.dll` validation across 26,503 containers in the shader archive (614 duplicates skipped; `14,247` VP, `2,676` CS, `8,694` MS; `272` unsupported: `195` non-VS/PS/CS/MS stages, `71` MS > 32 KiB, `6` multi-wave console wave64 CS), plus **40 / 44** across title binaries (`12` VP, `28` CS; `3` non-VS/PS/CS/MS, `1` console wave64 CS) |
 | Live in-game status (RTX 3060 Ti, prior runs) | Menus reached `29.9–30.8 fps` (`shadow::sweep` stalls eliminated); world runs reached `1+ fps`, with a deferred-lighting resolve shader dropped and stale `R9G9B9E5_SHAREDEXP` syncs causing yellow/black-sphere frames |
-| Live in-game status (after 2026-11-26 Stage 3 & Stage 4 lighting, depth/stencil twin & shader pass) | **Ready for live re-test** (`victory-gpu`: `144 passed; 0 failed; 4 ignored`; `release` & `diag` built) |
+| Live in-game status (after 2026-11-26 CPU frame & Wave32 shader pass) | **Ready for live re-test** (`victory-gpu`: `144 passed; 0 failed; 4 ignored`; `victory-shader`: `283 passed; 4 failed; 6 ignored`; `release` & `diag` built) |
 | Ray tracing (`VICTORY_RAYS`) | Disabled by default; BVH builder/wind compute passes stay skipped unless opted in |
 
 ### What this fork changes
 
 #### NVIDIA & Wave32 hardware compatibility (`victory-shader`, `victory-gpu`)
-- **Wave64-on-Wave32 lowering (`crates/victory-shader/src/emit/lower.rs`)**:
+- **Wave64-on-Wave32 lowering (`crates/victory-shader/src/emit/lower.rs`, `emit/mod.rs`)**:
   scalars derived from VALU/VGPR sources remain CTA-uniform on single-wave
   Wave32 dispatches (`group <= 64`), letting LDS barriers and stores lower
-  without spurious Wave64 retry failures.
+  without spurious Wave64 retry failures; single-wave compute dispatches
+  (`<= 64` threads, without `ds_permute`) that cannot split across 32-lane
+  waves fall back to `CONSOLE_FLOW` (`wants_console_flow` + `lower_program`
+  retry via `is_wave64_refusal`); and `scc_bit` propagates non-`LANE_MASK`
+  `Val::Missing` reasons (such as `UNTRACKED_SELECT`) and checks `mask_scc`,
+  fixing all 18 remaining failing Wave32 compute shaders (`shadowmask`,
+  particle emit/update, decal trail, water interaction/shading) through DXIL
+  validation and D3D12 pipeline creation.
 - **Scalarized light-loop `OwnBits` analysis (`crates/victory-shader/src/emit/own_bits.rs`)**:
   proves when a `WaveActiveBitOr` only drives a loop over each lane's own
   set bits and allows a 32-lane wave OR to stand in for 64 lanes
@@ -40,9 +47,11 @@ intact.
   user-data spill-table loads are unspilled in production builds on both
   Wave32 and Wave64, `would_unspill` gates un-unspilled BVH stages when
   `VICTORY_RAYS` is off, `ir::unspill` scans forward within basic blocks so
-  separated `v_writelane_b32` mask-save halves pair into `s_mov_b64` (fixing
-  `108` additional Wave32 shaders including deferred lighting resolve), and
-  `structure.rs` tracks incoming edge masks for phi joins (`phi_masks`).
+  separated `v_writelane_b32` mask-save halves pair into `s_mov_b64` and pairs
+  matching 64-bit SGPR save/restore instructions even when one of the parked
+  VGPR lanes is later reused for a single-lane scalar (eliminating the final
+  `opaque lane mask` pixel shader failure), and `structure.rs` tracks incoming
+  edge masks for phi joins (`phi_masks`).
 - **Capped descriptor heap handling (`victory-gpu`, commits `9941b5e`, `0390c9e`)**:
   probes padded view heaps at startup and clamps view indices to the null slot
   on capped heaps (`2^18` dynamic slots), instead of failing shader translation
@@ -80,8 +89,11 @@ intact.
   frames do not refill the plan budget mid-frame; checks elapsed time per slot
   and caps exhausted-budget urgent overflow (`URGENT_OVERFLOW_FRAME_US = 4_000`
   via `HostHeap::urgent_overflow_left` / `spend_urgent_overflow`), deferring
-  full stale-view scans when budget is zero; and keeps small draw
-  root-constant assembly on the stack in `draw.rs`.
+  full stale-view scans when budget is zero; keeps draw root-constant assembly
+  on the stack via `u64` slot bitmasks in `draw.rs`; and uses an incremental
+  `FORGOTTEN` log (`forgotten_since`), reverse `by_view` map, and `busy_dirty`
+  tracking in `descriptor.rs` / `descriptor/host.rs` to skip full stale-view
+  scans and `BindlessPlan` rebuilds when no slots changed.
 - **8 GB placed + non-streamed texture budget, eviction backoff & bounded sparse sweeps (`resource.rs`, `list.rs`, `texture.rs`, `shadow.rs`)**:
   tracks active cached placed textures in `PLACED_CACHE_BYTES` and evicts idle
   placed textures by `HostTexture::used` (`evict_idle_placed_to`) with a
@@ -106,19 +118,24 @@ intact.
   only within a `256 KiB` gap) with parallel `copy_host_bytes` (`>= 512 KiB`)
   instead of single-threaded whole-heap gap copies in `Shadow::writing`;
   parallelizes `Shadow::copy_back_many`, `sparse_back_many`, and
-  `merge_card_pieces` lock-free across cores and coalesces contiguous
-  `PAGE`-gap `watch::writing` syncs afterward; reports wall-clock (not
-  thread-summed) `PREPARING` copy times and avoids double-counting
-  `Batch::title_written` inside `Step::Copy`; and batches `s.looks` locking +
-  parallel `copy_tiles` / `card::finish_back`.
+  `merge_card_pieces` lock-free across cores (`sync_written_pages`,
+  `flush_title_writes`, 64-bit `merge_gpu_writes_inner`), deduplicates
+  per-submission `gpu_written` / `declared` / `card_seen` / `cpu_seen` ranges
+  and flushes only overlapping `Batch::flush_shadow_range` spans across command
+  lists, switches `shadow::BUFFERS` / `LOOSE` lookup maps to `RwLock`, reports
+  wall-clock (not thread-summed) `PREPARING` copy times and avoids
+  double-counting `Batch::title_written` inside `Step::Copy`, and batches
+  `s.looks` locking + parallel `copy_tiles` / `card::finish_back`.
 - **Coalesced `GetWriteWatch` & view-guard coherence (`watch.rs`, `shadow.rs`, `host.rs`, `texture.rs`)**:
   adds `ask_once` (`VICTORY_ASK_ONCE=0` disables) across submission
-  refreshes plus `ask_ahead` batching for `Batch::flush` and `prepare_bindless`
-  `reads` (avoiding thousands of unbatched kernel `GetWriteWatch` calls);
+  refreshes plus batched `ask_ahead` across all `prepare_bindless` heaps
+  (avoiding thousands of unbatched kernel `GetWriteWatch` calls); tracks
+  `Guards::scanned` and `Guards::recheck` intervals to short-circuit clean
+  repeated view-guard walks; scales `REGION_BUCKETS = 2048` (`4 MiB` buckets);
   removes repeated `bump_region_epochs` calls during active pin polls and skips
   `clean_spans` via `any_pinned` only for overlapping ranges so pinned blocks
-  stay reported without invalidating clean sibling ranges in the same 64 MiB
-  bucket; and uses `writes_since` / `writes_guarded_since` with `min_copied`.
+  stay reported without invalidating clean sibling ranges in the same bucket;
+  and uses `writes_since` / `writes_guarded_since` with `min_copied`.
 
 #### Upstream `Belobug` & inherited features retained
 - Fallback ambient lighting (`VICTORY_AMBIENT`, `VICTORY_AMBIENT_TINT`,
@@ -137,29 +154,31 @@ All checks below ran after the latest code edits with `--locked` on Windows 11 +
 
 - `cargo check --workspace --all-targets --locked`: **passed**
 - `cargo build --release --locked` and `cargo build --profile diag -p victory --features diagnostics --locked`: **passed**
-- `victory-gpu` (`-- --test-threads=1`): **`144 passed; 0 failed; 4 ignored`** (including `twin::tests::wanted_accepts_single_plane_and_depth_stencil_formats`, `twin::tests::stencil_buffer_copy_and_array_depth_twins_work_without_stencil_ref`, `draw::group_limit_tests::dsv_access_detects_read_only_depth_and_stencil`, and `shared_exponent_post_work_and_excluding_keep_sync_accurate`); `twin::tests` also passed **`2 passed; 0 failed`** under `--features diagnostics` with `VICTORY_D3D12_DEBUG=1`
-- Unchanged in this `victory-gpu` commit (last run on `2cea5a1`):
-  `victory-shader` (`279 passed; 4 failed; 6 ignored` — same 4 pre-existing Wave32 `emit::valu_tests` failures listed below; `ir::tests::spilled_lanes_become_scalars` passed), `victory` (`1 passed`), `victory-core` (`11 passed`), `victory-formats` (`24 passed; 4 ignored`), `victory-game` (`2 passed`), `victory-pe` (`7 passed`), `victory-pipeline` (`4 passed`), `victory-loader` (`22 passed; 1 ignored` lib + `4 passed` across `crash_log`, `load_probe`, and `title_dlls`)
+- `victory-gpu` (`-- --test-threads=1`): **`144 passed; 0 failed; 4 ignored`**; diagnostics `shadow::tests`: **`8 passed; 0 failed; 1 ignored`**
+- `victory-shader` (`-- --test-threads=1`): **`283 passed; 4 failed; 6 ignored`** (all `ir::tests` and `emit::split_tests` pass including paired reused-lane unspilling and single-wave `console_cf` / `scc_bit` tests; same 4 pre-existing Wave32 `emit::valu_tests` failures listed below)
+- Other workspace test targets (`-- --test-threads=1`): `victory` (`1 passed`), `victory-core` (`11 passed`), `victory-formats` (`24 passed; 4 ignored`), `victory-game` (`2 passed`), `victory-loader` (`22 passed; 1 ignored` lib + `4` across `crash_log`, `load_probe`, and `title_dlls`), `victory-pe` (`7 passed`), `victory-pipeline` (`4 passed`)
+- `victory translate --validate --pipelines --host-lanes 32-32`: all **19** newly unblocked shaders (`1` PS, `18` CS) passed `dxil.dll` validation and D3D12 pipeline creation; full archive `--validate --host-lanes 32-32`: **`25,617`** validated across **`26,503`** containers (`614` duplicates skipped; `14,247` VP, `2,676` CS, `8,694` MS; `272` unsupported), plus **`40 / 44`** across title binaries (`12` VP, `28` CS)
 - `cargo-clippy.exe` is not installed on this toolchain.
 
 ### Known problems
 
-- **Unverified in-game after the 2026-11-26 Stage 3 & Stage 4 passes**:
-  live playback has not yet been re-tested with the `ir::unspill` paired
-  mask-save fix, post-draw/dispatch `R9G9B9E5_SHAREDEXP` sync fix, expanded
-  depth/stencil UAV twins (`R16_TYPELESS`/`R32_TYPELESS` + buffer-backed stencil
-  sync without `SV_StencilRef`), and read-only DSV+SRV barrier handling.
+- **Unverified in-game after the 2026-11-26 CPU frame & Wave32 shader pass**:
+  live playback has not yet been re-tested with the `watch`/`shadow`/`bindless`
+  CPU optimizations and the 19 newly enabled Wave32 shaders (pixel visibility,
+  shadow-mask, GPU particle emit/update, decal trail, and water shading CS).
 - **Wave32 unsupported console shaders**: across the shader archive,
-  `290` of `25,889` tracked programs still fail to emit DXIL (`195`
-  untracked-SGPR-address stages, `71` mesh shaders exceeding 32 KiB, `14`
-  console wave64 lane ops, `9` wave64 LDS-sharing shaders without barriers,
-  and `1` `opaque lane mask` case).
+  `272` of `25,889` unique programs still fail to emit DXIL (`195`
+  non-VS/PS/CS/MS stages, `71` mesh shaders exceeding 32 KiB, and `6`
+  multi-wave console wave64 CS with `> 64` threads using cross-wave branches,
+  lane-63 reads, or unguarded LDS swaps); `1` console wave64 CS remains
+  unsupported in title binaries alongside `3` non-VS/PS/CS/MS stages.
 - **Pre-existing failing tests (4 + 5 + 1)**:
-  - `victory-shader` (`279 passed; 4 failed; 6 ignored`): 4 pre-existing Wave32
+  - `victory-shader` (`283 passed; 4 failed; 6 ignored`): 4 pre-existing Wave32
     `emit::valu_tests` failures (`loop_exit_mask_counted_after_the_loop`,
     `mask_grown_inside_a_branch_counted_after_it`,
     `scalar_counted_in_a_divergent_loop_read_after_it`,
-    `scalar_counted_in_nested_divergent_loops`).
+    `scalar_counted_in_nested_divergent_loops`, where `build_lanes_cs` calls
+    `lower::lower` with `Target::ANY` and runs on Wave32 host hardware).
   - `victory-hle` (`97 passed; 5 failed; 1 ignored`): 5 pre-existing
     `modules::xmem::tests` failures (`a_run_keeps_the_placeholders_it_spans`,
     `a_run_maps_across_two_placeholders`,

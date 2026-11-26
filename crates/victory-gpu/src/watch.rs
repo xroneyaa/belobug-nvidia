@@ -39,8 +39,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// While a span's region epoch stays unchanged, any range already guarded and
 /// copied at that epoch cannot have been modified by the title — and
 /// `copy_back` on one buffer no longer invalidates clean spans in other regions.
-const REGION_SHIFT: usize = 26; // 64 MiB per bucket
-const REGION_BUCKETS: usize = 1024;
+const REGION_SHIFT: usize = 22; // 4 MiB per bucket
+const REGION_BUCKETS: usize = 2048;
 static REGION_EPOCHS: [AtomicU64; REGION_BUCKETS] =
     [const { AtomicU64::new(1) }; REGION_BUCKETS];
 
@@ -141,7 +141,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         .filter(|r| r.0 < r.1)
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
-    if pieces.len() < 2 {
+    if pieces.is_empty() {
         return;
     }
     pieces.sort_unstable();
@@ -227,13 +227,16 @@ pub(crate) fn wrote(at: usize, len: usize) {
 }
 
 fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
-    if pieces.len() < 2 {
+    if pieces.is_empty() {
         return;
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
     if ask_kernel(j, first, last) {
         j.ahead.push((first, last));
+        return;
+    }
+    if pieces.len() < 2 {
         return;
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
@@ -425,6 +428,12 @@ struct Guards {
     /// the kernel does not fault into our handler, it fails. Until then
     /// they are not made read-only, and every check reports them written.
     pins: Vec<(usize, usize, std::time::Instant)>,
+    /// Sorted, disjoint `[first_block, last_block)` spans already walked by `guard`
+    /// where every non-hole block is either guarded+clean or listed in `recheck`.
+    scanned: Vec<(usize, usize)>,
+    /// Blocks inside protected/scanned spans that were opened or aliased without
+    /// yet being re-marked clean/protected.
+    recheck: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -433,7 +442,53 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     holes: BTreeSet::new(),
     aliased: BTreeSet::new(),
     pins: Vec::new(),
+    scanned: Vec::new(),
+    recheck: BTreeSet::new(),
 });
+
+fn is_scanned(scanned: &[(usize, usize)], first: usize, last: usize) -> bool {
+    if first >= last {
+        return true;
+    }
+    let idx = scanned.partition_point(|&(a, _)| a <= first);
+    idx > 0 && scanned[idx - 1].1 >= last
+}
+
+fn add_scanned(scanned: &mut Vec<(usize, usize)>, mut first: usize, mut last: usize) {
+    if first >= last {
+        return;
+    }
+    let start_idx = scanned.partition_point(|&(_, b)| b < first);
+    let mut end_idx = start_idx;
+    while end_idx < scanned.len() && scanned[end_idx].0 <= last {
+        first = first.min(scanned[end_idx].0);
+        last = last.max(scanned[end_idx].1);
+        end_idx += 1;
+    }
+    scanned.splice(start_idx..end_idx, [(first, last)]);
+}
+
+fn remove_scanned(scanned: &mut Vec<(usize, usize)>, first: usize, last: usize) {
+    if first >= last || scanned.is_empty() {
+        return;
+    }
+    let start_idx = scanned.partition_point(|&(_, b)| b <= first);
+    let mut end_idx = start_idx;
+    let mut replacement = Vec::new();
+    while end_idx < scanned.len() && scanned[end_idx].0 < last {
+        let (a, b) = scanned[end_idx];
+        if a < first {
+            replacement.push((a, first));
+        }
+        if last < b {
+            replacement.push((last, b));
+        }
+        end_idx += 1;
+    }
+    if start_idx < end_idx {
+        scanned.splice(start_idx..end_idx, replacement);
+    }
+}
 
 /// How long blocks stay writable after [`writing`].
 const PIN: std::time::Duration = std::time::Duration::from_secs(2);
@@ -563,6 +618,47 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    {
+        let mut g = guards();
+        if !g.pins.is_empty() {
+            let now = std::time::Instant::now();
+            g.pins.retain(|&(_, _, until)| until > now);
+        }
+        if is_scanned(&g.scanned, first, last) {
+            let dirty: Vec<usize> = g.recheck.range(first..last).copied().collect();
+            let has_pin = g.pins.iter().any(|&(p0, p1, _)| p0 < last && p1 > first);
+            if dirty.is_empty() && !has_pin {
+                return Some(Vec::new());
+            }
+            let mut written = Vec::new();
+            for b in dirty {
+                g.recheck.remove(&b);
+                if g.holes.contains(&b) {
+                    continue;
+                }
+                if g.pinned(b) {
+                    written.extend(b * BLOCK / PAGE..(b + 1) * BLOCK / PAGE);
+                } else if g.protected.contains(&b) {
+                    g.clean.insert(b);
+                    written.extend(b * BLOCK / PAGE..(b + 1) * BLOCK / PAGE);
+                } else {
+                    protect(&mut g, b, b + 1, &mut written);
+                }
+            }
+            if has_pin {
+                for &(p0, p1, _) in &g.pins {
+                    let lo = p0.max(first);
+                    let hi = p1.min(last);
+                    for b in lo..hi {
+                        if !g.holes.contains(&b) {
+                            written.extend(b * BLOCK / PAGE..(b + 1) * BLOCK / PAGE);
+                        }
+                    }
+                }
+            }
+            return Some(written);
+        }
+    }
     let (mut g, check_each) = {
         let g = guards();
         if g.protected.contains(&first) {
@@ -586,6 +682,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     };
     let mut written = Vec::new();
     if first < last && g.clean.range(first..last).count() == last - first {
+        if !g.pins.iter().any(|&(p0, p1, _)| p0 < last && p1 > first) {
+            add_scanned(&mut g.scanned, first, last);
+        }
         return Some(written);
     }
     if !g.pins.is_empty() {
@@ -599,6 +698,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             && !g.holes.contains(&block)
             && (!check_each || mapped(block * BLOCK));
         if open {
+            g.recheck.remove(&block);
             if g.pinned(block) {
                 // The kernel may be writing it: left writable, reported
                 // written at every check until the pin ends.
@@ -611,10 +711,15 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 run.get_or_insert(block);
                 continue;
             }
+        } else if block < last {
+            g.recheck.remove(&block);
         }
         if let Some(from) = run.take() {
             protect(&mut g, from, block, &mut written);
         }
+    }
+    if !g.pins.iter().any(|&(p0, p1, _)| p0 < last && p1 > first) {
+        add_scanned(&mut g.scanned, first, last);
     }
     Some(written)
 }
@@ -766,6 +871,7 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
                 // SAFETY: title view memory; only its protection changes.
                 if unsafe { VirtualProtect(at as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
                     g.protected.insert(alias);
+                    g.recheck.insert(alias);
                 }
             }
         }
@@ -807,6 +913,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        g.recheck.insert(block);
     }
     // Runs of blocks next to each other in one call (fewer kernel
     // transitions and TLB shootdowns). One call cannot span two views: the
@@ -855,6 +962,7 @@ pub fn writing(at: usize, len: usize) {
     let mut g = guards();
     let until = std::time::Instant::now() + PIN;
     g.pins.push((first, last, until));
+    remove_scanned(&mut g.scanned, first, last);
     open(&mut g, at, at + len);
     bump_region_epochs(at, at + len);
     if !view_guard() {
@@ -869,7 +977,9 @@ pub fn writing(at: usize, len: usize) {
         }
         for alias in shown {
             if alias / BLOCK != block {
-                g.pins.push((alias / BLOCK, alias / BLOCK + 1, until));
+                let ab = alias / BLOCK;
+                g.pins.push((ab, ab + 1, until));
+                remove_scanned(&mut g.scanned, ab, ab + 1);
                 open_here(&mut g, alias, alias + BLOCK);
                 bump_region_epochs(alias, alias + BLOCK);
             }
@@ -915,6 +1025,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             .copied()
             .collect();
         let changed = !holes.is_empty() || !blocks.is_empty();
+        remove_scanned(&mut g.scanned, r0, r1);
+        let gone_recheck: Vec<usize> = g.recheck.range(r0..r1).copied().collect();
+        for block in gone_recheck {
+            g.recheck.remove(&block);
+        }
         for block in holes {
             g.holes.remove(&block);
         }
@@ -1017,6 +1132,7 @@ pub(crate) fn try_open_guarded(at: usize) -> bool {
             )
         } != 0;
         if opened {
+            g.recheck.insert(block / BLOCK);
             bump_region_epochs(block, block + BLOCK);
             tracing::warn!(at = format_args!("{at:#x}"), "a read-only view block that no guard knew was opened");
         }

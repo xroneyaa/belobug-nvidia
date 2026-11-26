@@ -355,6 +355,8 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
 });
+#[cfg(windows)]
+static FORGOTTEN: std::sync::Mutex<(u64, u64, Vec<u32>)> = std::sync::Mutex::new((0, 0, Vec::new()));
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 impl View {
@@ -409,6 +411,8 @@ pub(crate) fn forget(resource: usize) {
     };
     #[cfg(windows)]
     host::bindless_viewed_changed();
+    #[cfg(windows)]
+    let mut freed = Vec::new();
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -421,7 +425,35 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        #[cfg(windows)]
+        freed.push(i);
     }
+    #[cfg(windows)]
+    if !freed.is_empty() {
+        const CAP: usize = 32_768;
+        let mut log = FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
+        log.1 += freed.len() as u64;
+        log.2.extend(freed);
+        if log.2.len() > CAP {
+            let trim = log.2.len() - CAP / 2;
+            log.2.drain(..trim);
+            log.0 += trim as u64;
+        }
+    }
+}
+
+/// View entry indices freed since sequence `seen`, or `Err(now)` if the log
+/// overflowed past `seen` (requiring a full check).
+#[cfg(windows)]
+fn forgotten_since(seen: u64) -> Result<(u64, Vec<u32>), u64> {
+    let log = FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen >= log.1 {
+        return Ok((seen, Vec::new()));
+    }
+    if seen < log.0 {
+        return Err(log.1);
+    }
+    Ok((log.1, log.2[(seen - log.0) as usize..].to_vec()))
 }
 
 /// Of `entries` (slot, (view entry, generation)), those whose view went

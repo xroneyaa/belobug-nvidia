@@ -755,3 +755,96 @@ fn one_wave_scalar_branch_from_valu_allows_lds_on_wave32() {
         assert_eq!(got, want, "{name}: one_wave VALU scalar branch + LDS");
     }
 }
+
+#[test]
+fn one_wave_divergent_lds_without_barriers_runs_via_console_cf_on_wave32() {
+    let body = [
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0006, // s_cbranch_execz +6
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0x4A0A_00FF,
+        100,         // v_add_nc_u32 v5, 100, v0
+        0xD834_0000,
+        0x0000_0504, // ds_write_b32 v4, v5
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+        0x7D86_00A0, // v_cmp_le_u32 vcc, 32, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0005, // s_cbranch_execz +5
+        0x3A08_00A0, // v_xor_b32 v4, 32, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xD8D8_0000,
+        0x0200_0004, // ds_read_b32 v2, v4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+    ];
+    let mut native = program(&body, 64);
+    if let StageIo::Cs(ref mut cs) = native.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    let want: Vec<u32> = (0..4 * 64)
+        .map(|t| {
+            let l = t % 64;
+            if l >= 32 { (l ^ 32) + 100 } else { 0 }
+        })
+        .collect();
+    for name in names {
+        let host = Host::on(&name).unwrap();
+        let target = host.target();
+        let cs = emit_for(&native, target)
+            .expect("divergent one_wave LDS without barrier translates");
+        if !target.runs(64) {
+            assert_eq!(wave_size(&cs.dxil), Some(32));
+        }
+        let got = run(&host, &native, 4).expect("divergent LDS without barrier runs");
+        assert_eq!(got, want, "{name}: divergent one_wave LDS without barrier");
+    }
+}
+
+#[test]
+fn one_wave_section_with_divergent_lane_read_runs_via_console_cf_on_wave32() {
+    let mut body = SUM_BODY.to_vec();
+    body.extend([
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0003, // s_cbranch_execz +3
+        0xD760_0009,
+        0x0001_6502, // v_readlane_b32 s9, v2, 50
+        0x4A04_0009, // v_add_nc_u32 v2, s9, v0
+        0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+    ]);
+    console_flow_case(
+        "one_wave section with divergent cross-half lane read",
+        &body,
+        64,
+        |t| {
+            let l = t % 64;
+            let sum = 63 * 64 / 2;
+            if l < 20 { sum + l } else { sum }
+        },
+    );
+}
+
+#[test]
+fn console_cf_scc_branch_retries_untracked_select_and_runs_on_wave32() {
+    let body = [
+        0x7E04_0287, // v_mov_b32 v2, 7
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE89_106A, // s_bcnt1_i32_b64 s9, vcc
+        0xBE8C_0381, // s_mov_b32 s12, 1
+        0xBE8D_0380, // s_mov_b32 s13, 0
+        0xD501_0003,
+        0x0031_0A80, // v_cndmask_b32_e64 v3, 0, 5, s[12:13]
+        0x7E1C_0503, // v_readfirstlane_b32 s14, v3
+        0xBF07_800E, // s_cmp_lg_u32 s14, 0
+        0xBF84_0001, // s_cbranch_scc0 +1
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case("console_cf scc branch after untracked select", &body, 64, |_| 40);
+}

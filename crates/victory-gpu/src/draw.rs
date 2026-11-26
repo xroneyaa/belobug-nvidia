@@ -1222,19 +1222,37 @@ impl State {
         used: &[UsedResource],
         compute: bool,
     ) -> Option<Vec<(u8, u32)>> {
+        if !used.iter().any(|u| u.root == RootType::Table) {
+            return Some(Vec::new());
+        }
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| matches!(u.kind, ResourceType::Cbv | ResourceType::Srv))
-            .map(|u| u.slot)
-            .collect();
+        let mut fresh_mask = 0u64;
+        let mut fresh_high: Vec<u8> = Vec::new();
+        let mark_fresh = |slot: u8, mask: &mut u64, high: &mut Vec<u8>| {
+            if slot < 64 {
+                *mask |= 1u64 << slot;
+            } else if !high.contains(&slot) {
+                high.push(slot);
+            }
+        };
+        let is_fresh = |slot: u8, mask: u64, high: &[u8]| {
+            if slot < 64 {
+                (mask & (1u64 << slot)) != 0
+            } else {
+                high.contains(&slot)
+            }
+        };
+        for u in used.iter().filter(tables) {
+            if matches!(u.kind, ResourceType::Cbv | ResourceType::Srv) {
+                mark_fresh(u.slot, &mut fresh_mask, &mut fresh_high);
+            }
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA, 2,048 samplers anywhere)
         // are made afresh too: the title's slots there have no host slot of
         // their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            if is_fresh(u.slot, fresh_mask, &fresh_high) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -1248,79 +1266,92 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                mark_fresh(u.slot, &mut fresh_mask, &mut fresh_high);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            if !is_fresh(u.slot, fresh_mask, &fresh_high) {
                 self.table_entry(list, u, compute);
             }
         }
+        if fresh_mask == 0 && fresh_high.is_empty() {
+            return Some(Vec::new());
+        }
         let mut made = Vec::new();
-        for slot in fresh {
+        let mut slots = [0u8; 64];
+        let mut nslots = 0usize;
+        let mut m = fresh_mask;
+        while m != 0 {
+            let bit = m.trailing_zeros() as u8;
+            slots[nslots] = bit;
+            nslots += 1;
+            m &= m - 1;
+        }
+        if !fresh_high.is_empty() {
+            fresh_high.sort_unstable();
+        }
+        for &slot in slots[..nslots].iter().chain(fresh_high.iter()) {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = entries
+            let needed = used
                 .iter()
+                .filter(|u| u.root == RootType::Table && u.slot == slot)
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
-            let last = table + u64::from(n - 1) * 32;
+            let last = table + u64::from(needed - 1) * 32;
             // Shaders read such a table to many lengths, and a copy for each
             // ran out of slots: the longest seen serves all.
-            let n = if n >= LARGE { longest(heap, table, n) } else { n };
+            let n = if needed >= LARGE {
+                longest(heap, table, needed)
+            } else {
+                needed
+            };
             if heap.index(last).is_none() {
-                for u in entries {
+                for u in used
+                    .iter()
+                    .filter(|u| u.root == RootType::Table && u.slot == slot)
+                {
                     self.table_entry(list, u, compute);
                 }
                 continue;
             }
-            let records: Vec<[u32; 3]> = if n >= LARGE {
-                (0..n)
+            if n >= LARGE {
+                let records: Vec<[u32; 3]> = (0..n)
                     // SAFETY: descriptor slots in title memory.
                     .map(|k| unsafe {
                         ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned()
                     })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let needed = entries
-                .iter()
-                .map(|u| u.table_offset_dwords as usize / 8 + 1)
-                .max()
-                .unwrap_or(1);
-            let same = self.large_tables.get(&table).and_then(|made| {
-                made.iter()
-                    .find(|(r, _)| r.len() >= needed && r[..needed] == records[..needed.min(records.len())])
-                    .map(|&(_, first)| first)
-            });
-            if n >= LARGE
-                && let Some(first) = same
-            {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
-                    let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    match crate::descriptor::view(handle) {
-                        Some(view) => readable(list, u, &view, &mut self.write_r32),
-                        None => self.null_uav |= u.kind == ResourceType::Uav,
+                    .collect();
+                let needed_u = needed as usize;
+                let same = self.large_tables.get(&table).and_then(|made| {
+                    made.iter()
+                        .find(|(r, _)| {
+                            r.len() >= needed_u && r[..needed_u] == records[..needed_u.min(records.len())]
+                        })
+                        .map(|&(_, first)| first)
+                });
+                if let Some(first) = same {
+                    for u in used
+                        .iter()
+                        .filter(|u| u.root == RootType::Table && u.slot == slot && u.kind != ResourceType::Cbv)
+                    {
+                        let handle = table + u64::from(u.table_offset_dwords) * 4;
+                        match crate::descriptor::view(handle) {
+                            Some(view) => readable(list, u, &view, &mut self.write_r32),
+                            None => self.null_uav |= u.kind == ResourceType::Uav,
+                        }
                     }
+                    made.push((slot, first * 32));
+                    continue;
                 }
-                made.push((slot, first * 32));
-                continue;
             }
             // The table and what its entries hold (record words).
             let key = {
@@ -1334,7 +1365,10 @@ impl State {
                 (table, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in used
+                    .iter()
+                    .filter(|u| u.root == RootType::Table && u.slot == slot && u.kind != ResourceType::Cbv)
+                {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     match crate::descriptor::view(handle) {
                         Some(view) => readable(list, u, &view, &mut self.write_r32),
@@ -1348,18 +1382,30 @@ impl State {
                 // A table holding constants made from the title's slots
                 // would view them misaligned: the draw is dropped. Other
                 // tables fall back to the title's slots.
-                if entries.iter().any(|u| u.kind == ResourceType::Cbv) {
+                if used
+                    .iter()
+                    .any(|u| u.root == RootType::Table && u.slot == slot && u.kind == ResourceType::Cbv)
+                {
                     once!(n, "a constant table did not fit in command-list slots; draw dropped");
                     return None;
                 }
                 once!(n, "descriptor table did not fit in command-list slots");
-                for u in entries {
+                for u in used
+                    .iter()
+                    .filter(|u| u.root == RootType::Table && u.slot == slot)
+                {
                     self.table_entry(list, u, compute);
                 }
                 continue;
             };
             self.fresh_tables.insert(key, first);
             if n >= LARGE {
+                let records: Vec<[u32; 3]> = (0..n)
+                    // SAFETY: descriptor slots in title memory.
+                    .map(|k| unsafe {
+                        ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned()
+                    })
+                    .collect();
                 self.large_tables.entry(table).or_default().push((records, first));
             }
             self.dynamic
@@ -1368,7 +1414,9 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let entry_used = used
+                    .iter()
+                    .find(|u| u.root == RootType::Table && u.slot == slot && u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
@@ -1380,12 +1428,12 @@ impl State {
                     }
                     Some(view) => {
                         host.make_at(index, &view);
-                        if let Some(u) = used {
+                        if let Some(u) = entry_used {
                             readable(list, u, &view, &mut self.write_r32);
                         }
                     }
                     None => {
-                        if let Some(u) = used {
+                        if let Some(u) = entry_used {
                             host.make_null_kind(index, u.kind, u.dwords);
                             once!(slot, "a table entry without a view");
                             self.null_uav |= u.kind == ResourceType::Uav;

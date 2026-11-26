@@ -160,6 +160,10 @@ struct BounceSlot {
 struct Bindless {
     /// Active `View::is_buffer()` slots: `slot_index -> (view_index, generation)`.
     slots: BTreeMap<u32, (u32, u32)>,
+    /// Reverse index: `view_index -> slot indices` for O(freed) stale checks.
+    by_view: HashMap<u32, Vec<u32>>,
+    /// Sequence watermark for `descriptor::forgotten_since`.
+    forgotten_seen: u64,
     /// Of them, those viewing placed textures.
     placed_set: BTreeMap<u32, (u32, u32)>,
     /// Placed-texture slots changed since draws last prepared them.
@@ -209,6 +213,45 @@ struct Bindless {
     /// The frame (plus one) the plan's lists of everything were last made in,
     /// and whether slots changed since.
     full: (u64, bool),
+    /// Whether `busy` or busy `SlotUse` entries changed since `plan` was rebuilt.
+    busy_dirty: bool,
+}
+
+impl Bindless {
+    fn set_slot(&mut self, index: u32, entry: (u32, u32)) -> bool {
+        let prev = self.slots.insert(index, entry);
+        if prev == Some(entry) {
+            return false;
+        }
+        if let Some((old_vi, _)) = prev
+            && old_vi != entry.0
+            && let Some(list) = self.by_view.get_mut(&old_vi)
+        {
+            if let Some(pos) = list.iter().position(|&s| s == index) {
+                list.swap_remove(pos);
+            }
+            if list.is_empty() {
+                self.by_view.remove(&old_vi);
+            }
+        }
+        if prev.is_none_or(|(old_vi, _)| old_vi != entry.0) {
+            self.by_view.entry(entry.0).or_default().push(index);
+        }
+        true
+    }
+
+    fn remove_slot(&mut self, index: u32) -> Option<(u32, u32)> {
+        let prev = self.slots.remove(&index)?;
+        if let Some(list) = self.by_view.get_mut(&prev.0) {
+            if let Some(pos) = list.iter().position(|&s| s == index) {
+                list.swap_remove(pos);
+            }
+            if list.is_empty() {
+                self.by_view.remove(&prev.0);
+            }
+        }
+        Some(prev)
+    }
 }
 
 /// Time for making changed slots, at submission and at recording: an eighth
@@ -1212,7 +1255,7 @@ impl HostHeap {
 
     fn track_bindless(&self, index: u32, entry: (u32, u32), placed: bool) {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-        if b.slots.insert(index, entry) != Some(entry) {
+        if b.set_slot(index, entry) {
             b.dirty.insert(index);
             b.recent.push(index);
             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
@@ -1232,7 +1275,7 @@ impl HostHeap {
 
     fn untrack_bindless(&self, index: u32) {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-        if b.slots.remove(&index).is_some() {
+        if b.remove_slot(index).is_some() {
             b.dirty.insert(index);
             b.recent.push(index);
             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
@@ -1247,12 +1290,12 @@ impl HostHeap {
     /// Slot `index` (viewing `entry`) is no longer one for bindless access.
     fn drop_bindless(&self, b: &mut Bindless, index: u32, entry: Option<(u32, u32)>) {
         b.uses.remove(&index);
-        b.busy.remove(&index);
+        b.busy_dirty |= b.busy.remove(&index);
         b.unmapped_slots.remove(&index);
         b.direct_slots.remove(&index);
         b.recorded.remove(&index);
         if entry.is_none_or(|e| b.slots.get(&index) == Some(&e)) {
-            b.slots.remove(&index);
+            b.remove_slot(index);
             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
                 bounce.active = false;
             }
@@ -1819,11 +1862,32 @@ impl HostHeap {
                 }
             }
             let check: Vec<(u32, (u32, u32))> = if viewed {
-                b.slots
-                    .iter()
-                    .filter(|(i, _)| !dirty.contains(i))
-                    .map(|(&i, &v)| (i, v))
-                    .collect()
+                match super::forgotten_since(b.forgotten_seen) {
+                    Ok((seq, vis)) => {
+                        b.forgotten_seen = seq;
+                        let mut out = Vec::new();
+                        for vi in vis {
+                            if let Some(slots) = b.by_view.get(&vi) {
+                                for &slot in slots {
+                                    if !dirty.contains(&slot)
+                                        && let Some(&v) = b.slots.get(&slot)
+                                    {
+                                        out.push((slot, v));
+                                    }
+                                }
+                            }
+                        }
+                        out
+                    }
+                    Err(seq) => {
+                        b.forgotten_seen = seq;
+                        b.slots
+                            .iter()
+                            .filter(|(i, _)| !dirty.contains(i))
+                            .map(|(&i, &v)| (i, v))
+                            .collect()
+                    }
+                }
             } else {
                 Vec::new()
             };
@@ -1844,7 +1908,9 @@ impl HostHeap {
                 made[i as usize] = 0;
             }
         }
-        todo.extend(stale_views(&check).into_iter().map(|(i, v)| (i, Some(v))));
+        if !check.is_empty() {
+            todo.extend(stale_views(&check).into_iter().map(|(i, v)| (i, Some(v))));
+        }
         let (started, left, urgent_cap) = (
             std::time::Instant::now(),
             self.budget_left(0),
@@ -1892,7 +1958,7 @@ impl HostHeap {
             match made {
                 None => {
                     b.uses.remove(&index);
-                    b.busy.remove(&index);
+                    b.busy_dirty |= b.busy.remove(&index);
                     b.unmapped_slots.remove(&index);
                     b.direct_slots.remove(&index);
                 }
@@ -1906,8 +1972,9 @@ impl HostHeap {
                     }
                     if u.read.is_some() || u.write.is_some() || u.bounce.is_some() {
                         b.busy.insert(index);
+                        b.busy_dirty = true;
                     } else {
-                        b.busy.remove(&index);
+                        b.busy_dirty |= b.busy.remove(&index);
                     }
                     if u.unmapped {
                         b.unmapped_slots.insert(index);
@@ -1938,6 +2005,9 @@ impl HostHeap {
         // All of it is copied by the first submission of a frame only: the
         // later ones take what is new.
         if !remake && let Some(plan) = &b.plan {
+            if fresh.is_empty() && fresh_reads.is_empty() {
+                return Some(plan.clone());
+            }
             let plan = Arc::new(BindlessPlan {
                 reads: plan.reads.clone(),
                 writes: plan.writes.clone(),
@@ -1951,6 +2021,15 @@ impl HostHeap {
             return Some(plan);
         }
         b.full = (frame, false);
+        if !b.busy_dirty
+            && !cfg!(test)
+            && let Some(plan) = &b.plan
+            && plan.fresh.is_empty()
+            && plan.fresh_reads.is_empty()
+        {
+            return Some(plan.clone());
+        }
+        b.busy_dirty = false;
         let (mut reads, mut writes, mut bounces, mut retained) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         // What slots view is held by the slots, and for some frames after

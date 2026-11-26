@@ -569,30 +569,50 @@ fn unspill(
             None
         }
     };
-    let mut pairs: Vec<(u8, u32)> = Vec::new();
+    let mut slot_pairs: Vec<(usize, (u8, u32))> = Vec::new();
     for &(reg, lane) in &slots {
-        if !wave64
-            || pairs.iter().any(|&(r, l)| r == reg && l + 1 == lane)
-            || !slots.contains(&(reg, lane + 1))
-        {
+        if !wave64 || !slots.contains(&(reg, lane + 1)) {
             continue;
         }
         let lower: Vec<usize> = (0..list.len())
             .filter(|&i| parks[i].is_some_and(|p| (p.1, p.3) == (reg, lane)))
             .collect();
-        let upper = parks
-            .iter()
-            .flatten()
-            .filter(|p| (p.1, p.3) == (reg, lane + 1))
-            .count();
-        let partners: Vec<Option<usize>> = lower.iter().map(|&i| partner(i)).collect();
-        let mut distinct: Vec<usize> = partners.iter().flatten().copied().collect();
-        distinct.sort_unstable();
-        distinct.dedup();
-        if partners.iter().all(Option::is_some)
-            && distinct.len() == lower.len()
-            && upper == lower.len()
-        {
+        let matched = lower.iter().filter(|&&i| partner(i).is_some()).count();
+        if matched > 0 {
+            slot_pairs.push((matched, (reg, lane)));
+        }
+    }
+    slot_pairs.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut pairs: Vec<(u8, u32)> = Vec::new();
+    let mut paired_with: Vec<Option<usize>> = vec![None; list.len()];
+    let mut paired_upper: Vec<bool> = vec![false; list.len()];
+    for &(_, (reg, lane)) in &slot_pairs {
+        if pairs.iter().any(|&(r, l)| {
+            r == reg && (l == lane || l + 1 == lane || l == lane + 1)
+        }) {
+            continue;
+        }
+        let mut candidates = Vec::new();
+        let (mut has_paired_save, mut has_paired_restore) = (false, false);
+        for i in 0..list.len() {
+            if let Some(p) = parks[i]
+                && (p.1, p.3) == (reg, lane)
+                && let Some(j) = partner(i)
+                && !paired_upper[j]
+            {
+                candidates.push((i, j, p.0));
+                if p.0 {
+                    has_paired_save = true;
+                } else {
+                    has_paired_restore = true;
+                }
+            }
+        }
+        if has_paired_save && has_paired_restore {
+            for (i, j, _) in candidates {
+                paired_with[i] = Some(j);
+                paired_upper[j] = true;
+            }
             pairs.push((reg, lane));
         }
     }
@@ -609,7 +629,7 @@ fn unspill(
             (108..123)
                 .chain((0..104).rev())
                 .chain(past..254)
-                .find(|&c| free[c] && free[c + 1])
+                .find(|&c| (c >= past || c % 2 == 0) && free[c] && free[c + 1])
         } else {
             (past..254).find(|&c| free[c] && free[c + 1])
         };
@@ -656,16 +676,13 @@ fn unspill(
         let Some(slot) = code_of(reg, lane) else {
             return Vec::new();
         };
-        if pairs.contains(&(reg, lane)) {
-            let Some(j) = partner(i) else {
-                return Vec::new();
-            };
+        if let Some(j) = paired_with[i] {
             let (at, gone) = if save { (j, i) } else { (i, j) };
             let (dst, src) = if save { (slot, code) } else { (code, slot) };
             edits.push((at, Some((true, dst, src))));
             edits.push((gone, None));
-        } else if lane > 0 && pairs.contains(&(reg, lane - 1)) {
-            // upper half of a pair: moved with the lower
+        } else if paired_upper[i] {
+            // upper half of a paired save/restore: moved with the lower
         } else {
             let (dst, src) = if save { (slot, code) } else { (code, slot) };
             edits.push((i, Some((false, dst, src))));
@@ -1733,6 +1750,36 @@ mod tests {
         let i = &p.blocks[0].insts;
         assert_eq!(i[1].reads[0].1, i[0].writes[0].1);
         assert!(p.inputs.iter().all(|i| !matches!(i.0, Reg::V(_))));
+    }
+
+    #[test]
+    fn reused_parked_lane_keeps_paired_save_and_restore() {
+        let p = build_words(
+            &[
+                0xD761_0005,
+                0x0001_0604, // v_writelane_b32 v5, s4, 3
+                0xD761_0005,
+                0x0001_0805, // v_writelane_b32 v5, s5, 4
+                0xD760_0006,
+                0x0001_0705, // v_readlane_b32 s6, v5, 3
+                0xD760_0007,
+                0x0001_0905, // v_readlane_b32 s7, v5, 4
+                // Reuse lane 3 alone as an independent 32-bit scalar spill later.
+                0xD761_0005,
+                0x0001_0608, // v_writelane_b32 v5, s8, 3
+                0xD760_0009,
+                0x0001_0705, // v_readlane_b32 s9, v5, 3
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let i = &p.blocks[0].insts;
+        assert_eq!(i[0].name(), "s_mov_b64");
+        assert_eq!(i[1].name(), "s_mov_b64");
+        assert_eq!(i[2].name(), "s_mov_b32");
+        assert_eq!(i[3].name(), "s_mov_b32");
+        assert_eq!(i[2].writes[0].0, i[0].writes[0].0);
+        assert_eq!(i[3].reads[0].0, i[2].writes[0].0);
     }
 
     #[test]
