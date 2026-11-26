@@ -102,13 +102,184 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
+    /// Page ranges asked ahead for a submission's refreshes (`ask_ahead` /
+    /// `ask_once`): `writes_since` answers ranges inside one from the journal
+    /// without extra kernel calls.
+    ahead: Vec<(usize, usize)>,
+    ahead_asked: u64,
+    /// When set (`ask_once`), `ahead` stays active across batches until
+    /// `ask_once_end`.
+    kept: bool,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
+    ahead: Vec::new(),
+    ahead_asked: 0,
+    kept: false,
 });
+
+/// Ranges closer than this in one submission are queried together (`8 MiB`),
+/// since each resetting `GetWriteWatch` call walks kernel page tables.
+const AHEAD_GAP: usize = (8 << 20) / PAGE;
+/// Maximum span of a single coalesced query (`1 GiB`).
+const AHEAD_MAX: usize = (1 << 30) / PAGE;
+
+/// Whether a submission queries `GetWriteWatch` once upfront for all kernel-watched
+/// refreshes (`VICTORY_ASK_ONCE=0` disables).
+pub(crate) fn once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
+}
+
+/// Coalesces write-watch queries for all `(start, end)` spans in `ranges`.
+pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.0 < r.1)
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    if pieces.len() < 2 {
+        return;
+    }
+    pieces.sort_unstable();
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    if j.kept {
+        return;
+    }
+    j.asked += 1;
+    j.ahead_asked = j.asked;
+    j.ahead.clear();
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        while k < pieces.len()
+            && pieces[k].0 <= last + AHEAD_GAP
+            && last.max(pieces[k].1) - first <= AHEAD_MAX
+        {
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        ask_run(j, &pieces[i..k]);
+        i = k;
+    }
+}
+
+/// Ends a non-`ask_once` ahead window (`Batch::flush` / `prepare_bindless`).
+pub(crate) fn ask_ahead_done() {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !j.kept {
+        j.ahead.clear();
+    }
+}
+
+/// Queries all kernel-watched refresh ranges of a submission at once (`VICTORY_ASK_ONCE`).
+pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
+    if !once() {
+        return;
+    }
+    ask_once_end();
+    ask_ahead(ranges);
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    if j.ahead.is_empty() {
+        j.asked += 1;
+        j.ahead_asked = j.asked;
+    }
+    for &(start, end) in ranges {
+        if start >= end {
+            continue;
+        }
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
+            j.ahead.push((first, last));
+        }
+    }
+    j.kept = !j.ahead.is_empty();
+}
+
+/// Ends the submission-wide [`ask_once`] journal window.
+pub(crate) fn ask_once_end() {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if j.kept {
+        j.kept = false;
+        j.ahead.clear();
+    }
+}
+
+/// Records host writes into `[at, at + len)` while `ask_once` stands so later
+/// refreshes within the same submission see those pages as dirty.
+pub(crate) fn wrote(at: usize, len: usize) {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !j.kept || len == 0 {
+        return;
+    }
+    j.asked += 1;
+    let now = j.asked;
+    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
+        j.written.insert(page, now);
+    }
+}
+
+fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
+    if pieces.len() < 2 {
+        return;
+    }
+    let first = pieces[0].0;
+    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+    if ask_kernel(j, first, last) {
+        j.ahead.push((first, last));
+        return;
+    }
+    let (a, b) = pieces.split_at(pieces.len() / 2);
+    ask_run(j, a);
+    ask_run(j, b);
+}
+
+fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let mut count = (last - first) * PAGE / KERNEL_PAGE;
+    j.found.resize(count.max(j.found.len()), 0);
+    let mut granularity = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: `j.found` has capacity for all 4 KiB pages in `[first, last)`.
+    let failed = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            (first * PAGE) as *const _,
+            (last - first) * PAGE,
+            j.found.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } != 0;
+    if failed {
+        return false;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Watches, 1);
+        add(C::WatchUs, started.elapsed().as_micros() as u64);
+    }
+    let now = j.ahead_asked;
+    let mut prev_page = usize::MAX;
+    for &at in &j.found[..count] {
+        let page = at / PAGE;
+        if page != prev_page {
+            j.written.insert(page, now);
+            prev_page = page;
+        }
+    }
+    true
+}
 
 fn collect_since(
     written: &BTreeMap<usize, u64>,
@@ -148,6 +319,12 @@ pub(crate) fn writes_since(
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        return Some((
+            j.ahead_asked,
+            collect_since(&j.written, first, last, since),
+        ));
+    }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
@@ -426,8 +603,6 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 // The kernel may be writing it: left writable, reported
                 // written at every check until the pin ends.
                 written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-                // No range holding it is clean meanwhile (`region_epoch`).
-                bump_region_epochs(block * BLOCK, (block + 1) * BLOCK);
             } else if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
@@ -442,6 +617,21 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     Some(written)
+}
+
+/// Whether any block in `[start, end)` currently has an active kernel-write pin.
+pub(crate) fn any_pinned(start: usize, end: usize) -> bool {
+    if start >= end {
+        return false;
+    }
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let mut g = guards();
+    if g.pins.is_empty() {
+        return false;
+    }
+    let now = std::time::Instant::now();
+    g.pins.retain(|&(_, _, until)| until > now);
+    g.pins.iter().any(|&(from, to, _)| from < last && to > first)
 }
 
 /// Scans `[start, end)` jumping over unmapped holes; returns the first
@@ -660,11 +850,13 @@ pub fn writing(at: usize, len: usize) {
     if len == 0 {
         return;
     }
+    wrote(at, len);
     let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
     let mut g = guards();
     let until = std::time::Instant::now() + PIN;
     g.pins.push((first, last, until));
     open(&mut g, at, at + len);
+    bump_region_epochs(at, at + len);
     if !view_guard() {
         return;
     }
@@ -679,6 +871,7 @@ pub fn writing(at: usize, len: usize) {
             if alias / BLOCK != block {
                 g.pins.push((alias / BLOCK, alias / BLOCK + 1, until));
                 open_here(&mut g, alias, alias + BLOCK);
+                bump_region_epochs(alias, alias + BLOCK);
             }
         }
     }
@@ -1181,5 +1374,77 @@ mod tests {
         title_memory_remapped(base, 2 * BLOCK);
         // SAFETY: allocation owned by this test.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn ask_once_coalesces_and_tracks_kernel_writes() {
+        // SAFETY: private write-watched reservation freed at the end of the test.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        // Clear initial write-watch state.
+        let _ = writes(base, base + 4 * PAGE, false);
+
+        // Write page 0 and page 2 before `ask_once`.
+        // SAFETY: committed pages inside `base`.
+        unsafe {
+            (base as *mut u8).write_volatile(11);
+            ((base + 2 * PAGE) as *mut u8).write_volatile(22);
+        }
+        ask_once(&[(base, base + PAGE), (base + 2 * PAGE, base + 3 * PAGE)]);
+        let (t0, w0) = writes_since(base, base + PAGE, false, 0).expect("page 0");
+        let (t2, w2) = writes_since(base + 2 * PAGE, base + 3 * PAGE, false, 0).expect("page 2");
+        assert_eq!(w0, vec![(base / PAGE, t0)]);
+        assert_eq!(w2, vec![(base / PAGE + 2, t2)]);
+
+        // Host writes recorded via `wrote` while `ask_once` stands stay visible.
+        wrote(base + 3 * PAGE, PAGE);
+        let (_, w3) = writes_since(base + 3 * PAGE, base + 4 * PAGE, false, 0).expect("page 3");
+        assert_eq!(w3.len(), 1);
+        assert_eq!(w3[0].0, base / PAGE + 3);
+        ask_once_end();
+        title_memory_remapped(base, 4 * PAGE);
+
+        // SAFETY: allocation owned by this test.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn any_pinned_matches_only_overlapping_blocks() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: pagefile section of two blocks, freed at the end.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        writing(view + BLOCK, BLOCK);
+        assert!(!any_pinned(view, view + BLOCK));
+        assert!(any_pinned(view + BLOCK, view + 2 * BLOCK));
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            )
+        };
+        title_memory_remapped(view, 2 * BLOCK);
     }
 }

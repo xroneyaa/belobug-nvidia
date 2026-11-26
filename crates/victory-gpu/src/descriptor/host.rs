@@ -1698,14 +1698,16 @@ impl HostHeap {
             {
                 return Some(plan.clone());
             }
+            let has_budget = b.budget()[0] > 0;
             if !look
                 && !remake
                 && b.recent.is_empty()
-                && b.budget()[0] == 0
+                && !has_budget
                 && let Some(plan) = &b.plan
             {
                 return Some(plan.clone());
             }
+            let look = look && has_budget;
             let viewed = look && b.checked.0 != epochs.0;
             let mem_changed = look && b.checked.2 != epochs.2;
             let live = if look { live.as_ref() } else { None };
@@ -1725,9 +1727,11 @@ impl HostHeap {
             // What the title wrote last comes first and is made whatever it
             // takes: shaders run with a table not made read zeros as indices
             // of other slots, and a texture's slot read as a buffer's stops
-            // the host GPU.
+            // the host GPU. When the frame budget is already spent, only a
+            // small burst of urgent writes runs per submission.
+            let urgent_limit = if has_budget { URGENT } else { 32 };
             let mut urgent = Vec::new();
-            while urgent.len() < URGENT
+            while urgent.len() < urgent_limit
                 && let Some(i) = b.recent.pop()
             {
                 if b.dirty.remove(&i) {
@@ -1737,10 +1741,19 @@ impl HostHeap {
             if b.dirty.is_empty() {
                 b.recent.clear();
             }
-            while dirty.len() < 4 * SLOT_CHUNK
-                && let Some(i) = b.dirty.pop_first()
+            if has_budget {
+                while dirty.len() < 4 * SLOT_CHUNK
+                    && let Some(i) = b.dirty.pop_first()
+                {
+                    dirty.insert(i);
+                }
+            }
+            if !has_budget
+                && !remake
+                && urgent.is_empty()
+                && let Some(plan) = &b.plan
             {
-                dirty.insert(i);
+                return Some(plan.clone());
             }
             if let Some(l) = live {
                 for (&i, u) in &b.uses {
@@ -1807,12 +1820,21 @@ impl HostHeap {
         let mut todo = todo.into_iter();
         let mut count = 0usize;
         for (index, entry) in todo.by_ref() {
-            let cap = if count < exempt {
-                left.saturating_mul(2).max(40_000)
+            if left == 0 && count >= exempt {
+                over = Some(index);
+                break;
+            }
+            let cap = if left == 0 {
+                // Frame budget is spent: cap emergency newly-written slots to
+                // at most ~1 ms per submission instead of 40 ms.
+                1_000
+            } else if count < exempt {
+                left.saturating_mul(2)
             } else {
                 left
             };
-            if (count & 15) == 0 && started.elapsed().as_micros() as u64 > cap {
+            let check_clock = left == 0 || (count & 15) == 0 || count == exempt;
+            if check_clock && count > 0 && started.elapsed().as_micros() as u64 > cap {
                 // Over budget: the rest waits for the next submission.
                 over = Some(index);
                 break;
@@ -4098,5 +4120,43 @@ void main() {
             host_tex.as_raw()
         );
         slot::<extern "system" fn(This) -> u32>(light_res, 0x10)(light_res);
+    }
+
+    #[test]
+    fn bindless_plan_caps_urgent_burst_when_budget_exhausted() {
+        let Some(_host) = host() else { return };
+        let (title_heap, base) = make_shader_heap(64);
+        let mem = crate::resource::Memory::zeroed(256 << 10, 64 << 10).unwrap();
+        let cbv = |at: u64, slot: u64| {
+            create_cbv(
+                std::ptr::null(),
+                &[at as u32, (at >> 32) as u32, 256, 0],
+                base + slot * 32,
+            );
+        };
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        // Establish an initial plan, then exhaust this frame's plan budget.
+        cbv(mem.address(), 0);
+        let _initial = host_heap.bindless_plan().unwrap();
+        host_heap.budget_spend(0, 1_000_000);
+        assert_eq!(host_heap.budget_left(0), 0);
+
+        // Queue >32 recently-written slots: zero-budget submissions cap urgent
+        // bursts to <=32 slots and skip background dirty work.
+        for slot in 1..48u64 {
+            cbv(mem.address() + slot * 256, slot);
+        }
+        {
+            let mut b = host_heap.bindless.lock().unwrap();
+            b.dirty.insert(60);
+        }
+        let _capped = host_heap.bindless_plan().unwrap();
+        let b = host_heap.bindless.lock().unwrap();
+        assert!(b.dirty.contains(&60), "background dirty slots must wait when budget is zero");
+        assert!(b.dirty.len() >= 16, "urgent burst past cap stays queued for next frame");
+        drop(b);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(title_heap), 0);
     }
 }

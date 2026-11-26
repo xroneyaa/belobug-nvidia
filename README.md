@@ -21,8 +21,8 @@ intact.
 |------|---------------|
 | Target adapters | NVIDIA RTX 3060 Ti 8 GB (Wave32 `32-32`, capped descriptor heap fallback); prior base also ran on AMD RX 9070 XT 16 GB (Wave64) |
 | Shader translation (Wave32 `32-32`) | **25,491 / 25,889** programs emit DXIL across 26,503 containers in the shader archive (614 duplicates skipped; 398 unsupported, see below) |
-| Live in-game status (RTX 3060 Ti, before CPU/FPS pass) | Initial Wave32/descriptor fixes brought world geometry, grass, trees, fences, and power lines onto screen (`706–3971 draws/frame`), though overexposed lighting halos remained and world frames ran at `0.2–1.3 fps` (`2.1–20.5 ms` GPU vs `2.4–6.1 s` CPU/wait overhead) with menu/transition stalls |
-| Live in-game status (after 2026-11-26 FPS pass) | **Not yet re-run in-game here** — verified by workspace builds, unit/D3D12 tests (`victory-gpu`: 133 passed), and ready in `target\release\victory.exe` / `target\diag\victory.exe` |
+| Live in-game status (RTX 3060 Ti, before Stage 2 CPU/freeze pass) | World frames rendered at `0.1–1.3 fps` (`1.6–7.3 s/frame`) with menu/loading stalls (`347–728 ms` `shadow::sweep` freezes, `1.5–1.6 s` `bindless_plan` urgent bursts, and thread/memory contention) |
+| Live in-game status (after 2026-11-26 Stage 2 FPS/freeze pass) | **Ready for live re-test** via `target\release\victory.exe` / `target\diag\victory.exe` (`victory-gpu`: `137 passed; 0 failed; 4 ignored`) |
 | Ray tracing (`VICTORY_RAYS`) | Disabled by default; BVH builder/wind compute passes stay skipped unless opted in |
 
 ### What this fork changes
@@ -49,47 +49,50 @@ intact.
 #### Pipeline queue, descriptor sync, CPU FPS & VRAM/commit fixes (`victory-gpu`)
 - **Graphics-first non-stalling pipeline scheduling (`crates/victory-gpu/src/pipeline/make.rs`, `library.rs`)**:
   splits urgent pipeline compilation into `urgent_graphics` (`graphics.is_some()`,
-  preempting compute) and `urgent_compute`; scales pipeline workers to `4..=12`
-  (dedicating `total / 3` normal-priority urgent workers); marks pipelines used
-  (`library::note_used`) before `enqueue`/`wait` so unbuilt urgent PSOs are not
-  evicted prematurely; defers periodic 250+ MB `Serialize` disk saves until
-  `>= 64` new pipelines accumulate and no urgent queue is active (`save_periodic`,
-  still saving small batches on drain/exit); bounds frame waits via
-  `VICTORY_PIPELINE_WAIT_MS` (default `150` ms) and `VICTORY_PIPELINE_WAIT_SHARED`
-  (`0` disables shared per-kind budget).
-- **`R9G9B9E5_SHAREDEXP` copy-bridge & descriptor sync (`descriptor/host.rs`, `draw.rs`, `host.rs`)**:
+  preempting compute) and `urgent_compute`; scales total pipeline workers to
+  `(cores / 2).clamp(2, 6)` so compilation does not starve menu/game threads;
+  marks pipelines used (`library::note_used`) before `enqueue`/`wait`; defers
+  periodic 250+ MB `Serialize` disk saves until `>= 64` new pipelines
+  accumulate and no urgent queue is active (`save_periodic`); and bounds frame
+  waits via `VICTORY_PIPELINE_WAIT_MS` (default `150` ms) and
+  `VICTORY_PIPELINE_WAIT_SHARED` (`0` disables shared per-kind budget).
+- **`R9G9B9E5_SHAREDEXP` copy-bridge & bounded bindless plans (`descriptor/host.rs`, `draw.rs`, `host.rs`)**:
   uses a D3D12 buffer-bridge copy fallback for `R9G9B9E5_SHAREDEXP` (DXGI
   format `42`) via shared `HostHeap::placed_raw_texture` across both bindless
   (`resolve_placed`) and root-table (`use_slot`) descriptor paths; flushes
-  dirty shared-exponent copies at the end of `HostContext::bind`; caps `URGENT`
-  bindless slot bursts (`256` + bounded time budget) so `bindless_plan` does
-  not stall multi-second frames; and keeps small draw root-constant assembly on
-  the stack in `draw.rs`.
-- **8 GB placed texture budget, eviction backoff & batched commitment (`resource.rs`, `texture.rs`, `059b5fd`)**:
+  dirty shared-exponent copies at the end of `HostContext::bind`; enforces the
+  per-frame plan budget (capping exhausted-budget urgent bursts to `<= 32`
+  slots / `1 ms` per submission and deferring full stale-view scans when budget
+  is zero instead of burning `40 ms` per submission); and keeps small draw
+  root-constant assembly on the stack in `draw.rs`.
+- **8 GB placed texture budget, eviction backoff & bounded sparse sweeps (`resource.rs`, `texture.rs`, `shadow.rs`)**:
   tracks active cached placed textures in `PLACED_CACHE_BYTES` and evicts idle
   placed textures by `HostTexture::used` (`evict_idle_placed_to`) with a
   4-frame CAS backoff (`try_evict_budget_with_backoff`) when active textures
-  fill the budget so `texture_at` misses do not repeatedly scan ~38,000 entries;
-  replaces exception-faulting per-64-KiB probes in `committed` with batched
-  `K32QueryWorkingSetEx` checks (`committed_blocks`); and parallelizes texture
-  staging refreshes in `Early::take` and `HostList::run_deferred`.
-- **Parallel copy/copy-back & sparse tile batching (`host.rs`, `shadow.rs`, `card.rs`, `61e1e4b`)**:
-  adds a nested-parallelism guard to `host::in_parallel`; parallelizes
-  `Batch::flush` (`Step::Refresh`/`pieces` grouped per root copy),
-  `prepare_bindless` `reads` (`least = 1`), `finish_submission` copy-back
-  groups (`least = 1`), `card::finish_back` entries (`least = 1`), and
-  `merge_card_pieces` across dirty 64 KiB pages; batches `s.looks` locking and
-  splits `>= 512 KiB` `copy_tiles` spans into parallel page-disjoint chunks;
-  and merges overlapping copy-backs (`merge_back_ranges`, `copy_back_many`,
-  `sparse_back_many`) with an early `gcd_u64` check in `sparse_on_element`
-  without reintroducing blocking `memory_pressure()`/`sweep_now()` calls.
-- **Multi-view & incremental write-watch coherence (`watch.rs`, `shadow.rs`, `texture.rs`)**:
-  unifies `guard` fast and slow paths (preserving active `pins`,
-  `bump_region_epochs`, clean-range skips, and `holes` checks), clears
-  overlapping `pins` and stale `JOURNAL.written` timestamps in
-  `title_memory_remapped`, and adds `writes_since` / `writes_guarded_since`
-  with per-`Shadow` `min_copied` watermarks and `Staging` timestamps to skip
-  allocating/scanning historical writes when pages have not changed.
+  fill the budget; replaces exception-faulting per-64-KiB probes in `committed`
+  with batched `K32QueryWorkingSetEx` checks (`committed_blocks`); skips both
+  unmapped and committed region extents via `region_state` in `shadow::sweep`
+  with rotating shadow cursors and a `4 ms` per-sweep time cap (eliminating
+  `347–728 ms` menu freezes under `VICTORY_SWEEP_TILES=2`); and parallelizes
+  texture staging refreshes in `Early::take` and `HostList::run_deferred`.
+- **Parallel copy/copy-back & disjoint UAV snapshots (`host.rs`, `shadow.rs`, `card.rs`)**:
+  stores disjoint UAV `Before::snapshots` segments (coalesced only within a
+  `256 KiB` gap) with parallel `copy_host_bytes` (`>= 512 KiB`) instead of
+  single-threaded whole-heap gap copies in `Shadow::writing`; parallelizes
+  `Shadow::copy_back_many` page comparisons across cores and coalesces contiguous
+  `watch::writes` syncs even when a submission targets a single shared heap;
+  guards `in_parallel` recursion and skips thread-pool spawn for small batches
+  (`< 256 KiB`); reports wall-clock (not thread-summed) `PREPARING` copy times
+  and avoids double-counting `Batch::title_written` inside `Step::Copy`; and
+  batches `s.looks` locking + parallel `copy_tiles` / `card::finish_back`.
+- **Coalesced `GetWriteWatch` & view-guard coherence (`watch.rs`, `shadow.rs`, `host.rs`, `texture.rs`)**:
+  adds `ask_once` (`VICTORY_ASK_ONCE=0` disables) across submission
+  refreshes plus `ask_ahead` batching for `Batch::flush` and `prepare_bindless`
+  `reads` (avoiding thousands of unbatched kernel `GetWriteWatch` calls);
+  removes repeated `bump_region_epochs` calls during active pin polls and skips
+  `clean_spans` via `any_pinned` only for overlapping ranges so pinned blocks
+  stay reported without invalidating clean sibling ranges in the same 64 MiB
+  bucket; and uses `writes_since` / `writes_guarded_since` with `min_copied`.
 
 #### Upstream `Belobug` & inherited features retained
 - Fallback ambient lighting (`VICTORY_AMBIENT`, `VICTORY_AMBIENT_TINT`,
@@ -108,7 +111,7 @@ All checks below ran with `--locked` on Windows 11 + RTX 3060 Ti (`host waves 32
 
 - `cargo check --workspace --all-targets --locked`: **passed**
 - `cargo build --release --locked` and `cargo build --profile diag -p victory --features diagnostics --locked`: **passed**
-- `victory-gpu` (`-- --test-threads=1`, run after the latest edits): **`133 passed; 0 failed; 4 ignored`**
+- `victory-gpu` (`-- --test-threads=1`, run after the latest edits): **`137 passed; 0 failed; 4 ignored`**
 - Other unchanged passing crates (last run prior to the `victory-gpu` CPU/FPS pass):
   `victory` (`1 passed`), `victory-core` (`11 passed`), `victory-formats`
   (`24 passed; 4 ignored`), `victory-game` (`2 passed`), `victory-pe`

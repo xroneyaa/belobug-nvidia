@@ -1305,6 +1305,25 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         let mut early = Early::default();
+        if crate::watch::once() && !runs.is_empty() {
+            let mut spans: std::collections::HashMap<usize, (usize, usize)> =
+                std::collections::HashMap::new();
+            for list in runs {
+                for step in &list.deferred().copies {
+                    if let Step::Refresh(shadow, address, len) = step
+                        && shadow.kernel_watched()
+                    {
+                        let end = address.saturating_add(*len);
+                        let span = spans
+                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                            .or_insert((*address, end));
+                        *span = (span.0.min(*address), span.1.max(end));
+                    }
+                }
+            }
+            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            crate::watch::ask_once(&ranges);
+        }
         if !runs.is_empty() {
             early.take(&mut batch, runs, false);
         }
@@ -1317,6 +1336,7 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.prepare_bindless();
+        crate::watch::ask_once_end();
         if !runs.is_empty() {
             early.take(&mut batch, runs, true);
         }
@@ -3032,8 +3052,8 @@ impl HostList {
                     {
                         copy_count += 1;
                     }
-                    let started = std::time::Instant::now();
                     batch.title_written();
+                    let started = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     copy_us += started.elapsed().as_micros() as u64;
                     copy_bytes += len as u64;
@@ -3208,13 +3228,45 @@ impl Batch {
         if per_shadow.is_empty() {
             return;
         }
-        in_parallel(&per_shadow, 1, |groups| {
-            for (shadow, spans) in groups {
+        let mut total_bytes = 0usize;
+        let mut ahead_ranges: Vec<(usize, usize)> = Vec::new();
+        for (shadow, spans) in &per_shadow {
+            for &(addr, len) in spans {
+                total_bytes = total_bytes.saturating_add(len);
+                if shadow.kernel_watched() && len > 0 {
+                    ahead_ranges.push((addr, addr.saturating_add(len)));
+                }
+            }
+        }
+        let ahead = !ahead_ranges.is_empty();
+        if ahead {
+            crate::watch::ask_ahead(&ahead_ranges);
+        }
+        let started = std::time::Instant::now();
+        let before = PREPARING[0].load(Ordering::Relaxed);
+        if per_shadow.len() > 1 && total_bytes >= (256 << 10) {
+            in_parallel(&per_shadow, 1, |groups| {
+                for (shadow, spans) in groups {
+                    for &(addr, len) in spans {
+                        update(shadow, addr, len);
+                    }
+                }
+            });
+            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+            PREPARING[0].fetch_sub(
+                summed.saturating_sub(started.elapsed().as_micros() as u64),
+                Ordering::Relaxed,
+            );
+        } else {
+            for (shadow, spans) in &per_shadow {
                 for &(addr, len) in spans {
                     update(shadow, addr, len);
                 }
             }
-        });
+        }
+        if ahead {
+            crate::watch::ask_ahead_done();
+        }
     }
 
     /// After every list's steps (no title copy follows): each directly
@@ -3224,6 +3276,7 @@ impl Batch {
     /// for copy-back only when a shader that may write memory uses the heap.
     fn prepare_bindless(&mut self) {
         self.flush();
+        crate::watch::ask_once_end();
         for (heap, writes) in std::mem::take(&mut self.bindless) {
             let started = std::time::Instant::now();
             let plan = heap.bindless_plan();
@@ -3233,9 +3286,34 @@ impl Batch {
             };
             let (reads, all) = plan.copy_constants();
             if !reads.is_empty() {
+                let mut total_bytes = 0usize;
+                let mut ahead_ranges: Vec<(usize, usize)> = Vec::new();
+                for (shadow, address, len) in reads {
+                    total_bytes = total_bytes.saturating_add(*len);
+                    if shadow.kernel_watched() && *len > 0 {
+                        ahead_ranges.push((*address, address.saturating_add(*len)));
+                    }
+                }
+                let ahead = !ahead_ranges.is_empty();
+                if ahead {
+                    crate::watch::ask_ahead(&ahead_ranges);
+                }
                 let started = std::time::Instant::now();
                 let copied = std::sync::atomic::AtomicU64::new(0);
-                in_parallel(reads, 1, |reads| {
+                if reads.len() > 1 && total_bytes >= (256 << 10) {
+                    in_parallel(reads, 1, |reads| {
+                        for (shadow, address, len) in reads {
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                use crate::copystat::{C, add};
+                                add(C::Refreshes, 1);
+                                add(C::RefreshBytes, *len as u64);
+                            }
+                            let n = shadow.update_lazily(*address, *len, all);
+                            copied.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                    });
+                } else {
                     for (shadow, address, len) in reads {
                         #[cfg(feature = "diagnostics")]
                         {
@@ -3246,9 +3324,12 @@ impl Batch {
                         let n = shadow.update_lazily(*address, *len, all);
                         copied.fetch_add(n as u64, Ordering::Relaxed);
                     }
-                });
+                }
                 PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
                 PREPARING[1].fetch_add(copied.into_inner(), Ordering::Relaxed);
+                if ahead {
+                    crate::watch::ask_ahead_done();
+                }
             }
             // shortcut: what shaders write through directly indexed slots into
             // copied memory stays in the copy (title memory used in place

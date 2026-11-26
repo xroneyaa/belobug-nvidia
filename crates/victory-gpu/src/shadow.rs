@@ -68,7 +68,7 @@ struct Direct {
 
 #[derive(Default)]
 struct Before {
-    snapshot: Option<(usize, Vec<u8>)>,
+    snapshots: Vec<(usize, Vec<u8>)>,
     unchanged: UnchangedPages,
 }
 
@@ -89,6 +89,7 @@ impl UnchangedPages {
         }
     }
 
+    #[cfg(test)]
     fn differs(&mut self, address: usize, current: &[u8], before: &[u8]) -> bool {
         let page = address / PAGE;
         let unchanged = &mut self.pages[page - self.start / PAGE];
@@ -128,6 +129,44 @@ fn pooled(n: usize) -> Vec<u8> {
     };
     v.clear();
     v
+}
+
+/// Copies `[from, to)` from `data` into `out`, splitting large copies (`>= 512 KiB`)
+/// across worker threads without zero-initializing `out` beforehand.
+fn copy_host_bytes(data: *const u8, from: usize, to: usize, out: &mut Vec<u8>) {
+    let len = to.saturating_sub(from);
+    if len == 0 {
+        return;
+    }
+    const PARALLEL_THRESHOLD: usize = 512 << 10;
+    const SLICE: usize = 512 << 10;
+    if len >= PARALLEL_THRESHOLD {
+        let base_out = out.len();
+        out.reserve(len);
+        // SAFETY: `base_out + len` fits in reserved capacity and every chunk writes a
+        // disjoint subslice before `set_len` exposes the initialized bytes.
+        unsafe {
+            let dst_addr = out.as_mut_ptr().add(base_out) as usize;
+            let src_addr = data.add(from) as usize;
+            let mut chunks = Vec::with_capacity(len.div_ceil(SLICE));
+            let mut off = 0usize;
+            while off < len {
+                let n = SLICE.min(len - off);
+                chunks.push((src_addr + off, dst_addr + off, n));
+                off += n;
+            }
+            crate::host::in_parallel(&chunks, 1, |batch| {
+                for &(s, d, n) in batch {
+                    std::ptr::copy_nonoverlapping(s as *const u8, d as *mut u8, n);
+                }
+            });
+            out.set_len(base_out + len);
+        }
+    } else {
+        // SAFETY: `[from, to)` lies inside the host copy's mapping.
+        let src = unsafe { std::slice::from_raw_parts(data.add(from), len) };
+        out.extend_from_slice(src);
+    }
 }
 
 /// Snapshot memory of one tile each, kept for reuse: a world frame takes
@@ -536,32 +575,54 @@ impl Shadow {
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
-        // SAFETY: inside the mapping.
-        let host =
-            |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+        if from >= to {
+            return;
+        }
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let before = &mut before.snapshot;
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
-            None => (from, to),
-        };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
+        let snapshots = &mut before.snapshots;
+        if snapshots
+            .iter()
+            .any(|(at, bytes)| *at <= from && to <= *at + bytes.len())
         {
             return;
         }
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
+        const SNAPSHOT_GAP: usize = 256 << 10;
+        let mut lo = snapshots.len();
+        let mut hi = 0usize;
+        for (i, (at, bytes)) in snapshots.iter().enumerate() {
+            let seg_end = at + bytes.len();
+            if !(seg_end.saturating_add(SNAPSHOT_GAP) < from || to.saturating_add(SNAPSHOT_GAP) < *at)
+            {
+                lo = lo.min(i);
+                hi = i + 1;
             }
-            None => grown.extend_from_slice(host(start, end)),
         }
-        *before = Some((start, grown));
+        if lo >= hi {
+            let mut seg = pooled(to - from);
+            copy_host_bytes(self.data, from, to, &mut seg);
+            let pos = snapshots
+                .iter()
+                .position(|(at, _)| *at > from)
+                .unwrap_or(snapshots.len());
+            snapshots.insert(pos, (from, seg));
+            return;
+        }
+        let merged_start = from.min(snapshots[lo].0);
+        let merged_end = to.max(snapshots[hi - 1].0 + snapshots[hi - 1].1.len());
+        let mut grown = pooled(merged_end - merged_start);
+        let mut cursor = merged_start;
+        for (at, bytes) in snapshots.drain(lo..hi) {
+            if cursor < at {
+                copy_host_bytes(self.data, cursor, at, &mut grown);
+            }
+            grown.extend_from_slice(&bytes);
+            cursor = at + bytes.len();
+            give_back(bytes);
+        }
+        if cursor < merged_end {
+            copy_host_bytes(self.data, cursor, merged_end, &mut grown);
+        }
+        snapshots.insert(lo, (merged_start, grown));
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -610,71 +671,133 @@ impl Shadow {
         }
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Before {
-            snapshot,
+            snapshots,
             unchanged,
         } = &mut *before;
         let mut written = 0;
-        for &(address, len) in &merged {
-            let (from, to) = self.inside(address, len);
-            let start = self.start as usize;
-            if let Some((taken, before)) = &*snapshot
-                && *taken <= from
-                && to <= taken + before.len()
-                && from < to
-            {
-                unchanged.begin(start + taken, start + taken + before.len());
-                let before = &before[from - taken..to - taken];
-                // By 64 KiB piece: the copy compared with its bytes before the
-                // submission, title memory read only where the GPU wrote.
-                // An unchanged page is never modified by copy-back, so later
-                // overlapping ranges can skip it for the rest of the submission.
-                let mode = self.watched.load(Ordering::Relaxed);
-                let mut title: Option<Vec<u8>> = None;
-                let mut synced = Vec::new();
-                let mut at = from;
-                while at < to {
-                    let n = (PAGE - (start + at) % PAGE).min(to - at);
-                    // SAFETY: inside the mapping; only the submitting thread
-                    // writes it.
-                    let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let old = &before[at - from..at - from + n];
-                    if unchanged.differs(start + at, host, old) {
-                        let buf = title.get_or_insert_with(|| {
-                            let mut v = pooled(PAGE);
-                            v.resize(PAGE, 0);
-                            v
-                        });
-                        let title_slice = &mut buf[..n];
-                        if crate::host::read_into((start + at) as *const u8, title_slice) {
-                            // Title memory with the GPU's bytes put in; the copy
-                            // takes the title's bytes in turn.
-                            if let Some((dirty_start, dirty_end)) =
-                                merge_gpu_writes(title_slice, host, old)
-                            {
-                                let dirty_len = dirty_end - dirty_start;
-                                if mode != 1 {
-                                    crate::watch::writing(start + at + dirty_start, dirty_len);
-                                }
-                                crate::host::write_mapped(
-                                    (start + at + dirty_start) as *mut u8,
-                                    title_slice[dirty_start..].as_ptr(),
-                                    dirty_len,
-                                );
-                                written += dirty_len;
+        let start = self.start as usize;
+        let end = start + self.len as usize;
+        if !snapshots.is_empty() {
+            unchanged.begin(start, end);
+            let mode = self.watched.load(Ordering::Relaxed);
+            // Collect all 64 KiB piece tasks intersecting active snapshot segments.
+            let mut candidates: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+            let mut scan_bytes = 0usize;
+            for &(address, len) in &merged {
+                let (from, to) = self.inside(address, len);
+                if from >= to {
+                    continue;
+                }
+                for (taken, snap_bytes) in snapshots.iter() {
+                    let seg_end = taken + snap_bytes.len();
+                    if seg_end <= from {
+                        continue;
+                    }
+                    if *taken >= to {
+                        break;
+                    }
+                    let seg_from = from.max(*taken);
+                    let seg_to = to.min(seg_end);
+                    let snap_ptr = snap_bytes.as_ptr() as usize;
+                    let mut at = seg_from;
+                    while at < seg_to {
+                        let n = (PAGE - (start + at) % PAGE).min(seg_to - at);
+                        let page_idx = (start + at) / PAGE - unchanged.start / PAGE;
+                        if !unchanged.pages[page_idx] {
+                            candidates.push((at, n, snap_ptr, at - *taken, candidates.len()));
+                            scan_bytes += n;
+                        }
+                        at += n;
+                    }
+                }
+            }
+            let mut differs = vec![0u8; candidates.len()];
+            let diff_base = differs.as_mut_ptr() as usize;
+            let host_base = self.data as usize;
+            if candidates.len() >= 2 && scan_bytes >= (512 << 10) {
+                crate::host::in_parallel(&candidates, 1, |batch| {
+                    for &(at, n, snap_ptr, snap_off, idx) in batch {
+                        // SAFETY: disjoint snapshot & copy slices, distinct index in `differs`.
+                        unsafe {
+                            let host = std::slice::from_raw_parts((host_base + at) as *const u8, n);
+                            let old = std::slice::from_raw_parts(
+                                (snap_ptr as *const u8).add(snap_off),
+                                n,
+                            );
+                            if host != old {
+                                *((diff_base as *mut u8).add(idx)) = 1;
                             }
-                            synced.push((start + at) / PAGE);
                         }
                     }
-                    at += n;
+                });
+            } else {
+                for &(at, n, snap_ptr, snap_off, idx) in &candidates {
+                    // SAFETY: disjoint slices inside `self.data` and `snap_bytes`.
+                    unsafe {
+                        let host = std::slice::from_raw_parts((host_base + at) as *const u8, n);
+                        let old =
+                            std::slice::from_raw_parts((snap_ptr as *const u8).add(snap_off), n);
+                        if host != old {
+                            differs[idx] = 1;
+                        }
+                    }
                 }
-                if let Some(buf) = title {
-                    give_back(buf);
+            }
+
+            let mut title: Option<Vec<u8>> = None;
+            let mut synced: Vec<(usize, usize, usize)> = Vec::new();
+            for (idx, &(at, n, snap_ptr, snap_off, _)) in candidates.iter().enumerate() {
+                if differs[idx] == 0 {
+                    let page = (start + at) / PAGE;
+                    if start + at == (page * PAGE).max(unchanged.start)
+                        && start + at + n == ((page + 1) * PAGE).min(unchanged.end)
+                    {
+                        unchanged.pages[page - unchanged.start / PAGE] = true;
+                    }
+                    continue;
                 }
-                // Pages made equal to title memory are current in the copy, so
-                // our own write is not taken for the title's; others keep what
-                // they had (a title write there shows at the next refresh).
-                let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-                if first < last && !synced.is_empty() && mode != NOT_WATCHED {
+                // SAFETY: `self.data + at` and `snap_ptr + snap_off` cover `n` valid bytes.
+                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                let old =
+                    unsafe { std::slice::from_raw_parts((snap_ptr as *const u8).add(snap_off), n) };
+                let buf = title.get_or_insert_with(|| {
+                    let mut v = pooled(PAGE);
+                    v.resize(PAGE, 0);
+                    v
+                });
+                let title_slice = &mut buf[..n];
+                if crate::host::read_into((start + at) as *const u8, title_slice) {
+                    // Title memory with the GPU's bytes put in; the copy
+                    // takes the title's bytes in turn.
+                    if let Some((dirty_start, dirty_end)) = merge_gpu_writes(title_slice, host, old)
+                    {
+                        let dirty_len = dirty_end - dirty_start;
+                        if mode != 1 {
+                            crate::watch::writing(start + at + dirty_start, dirty_len);
+                        }
+                        crate::host::write_mapped(
+                            (start + at + dirty_start) as *mut u8,
+                            title_slice[dirty_start..].as_ptr(),
+                            dirty_len,
+                        );
+                        written += dirty_len;
+                    }
+                    synced.push(((start + at) / PAGE, at, at + n));
+                }
+            }
+            if let Some(buf) = title {
+                give_back(buf);
+            }
+            if !synced.is_empty() && mode != NOT_WATCHED {
+                // Coalesce `watch::writing` syncs across contiguous pages per span
+                // instead of calling `GetWriteWatch`/`guard` once per chunk.
+                synced.sort_unstable_by_key(|s| s.0);
+                let mut run_first = synced[0].0;
+                let mut run_last = run_first + 1;
+                let flush_sync = |first: usize, last: usize, copied: &mut Vec<u64>| {
+                    if first >= last {
+                        return;
+                    }
                     let res = if mode == WATCHED_GUARDED {
                         crate::watch::writes_guarded(first * PAGE, last * PAGE)
                     } else {
@@ -682,23 +805,38 @@ impl Shadow {
                     };
                     if let Some((now, _)) = res {
                         let base = start / PAGE;
-                        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                        for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
+                        for page in first..last {
                             copied[page - base] = now;
                         }
                     }
+                };
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                for &(page, at, end_at) in &synced {
+                    if start + at > (page * PAGE).max(start)
+                        || start + end_at < ((page + 1) * PAGE).min(end)
+                    {
+                        continue;
+                    }
+                    if page <= run_last {
+                        run_last = run_last.max(page + 1);
+                    } else {
+                        flush_sync(run_first, run_last, &mut copied);
+                        run_first = page;
+                        run_last = page + 1;
+                    }
                 }
+                flush_sync(run_first, run_last, &mut copied);
             }
         }
         // Every submitted step that declared any of `ranges` is done with them
         // (one submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| !ranges.iter().any(|&(a, l)| r == (a, a.saturating_add(l))));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
+        if pending.is_empty() {
             unchanged.clear();
-            give_back(bytes);
+            for (_, bytes) in snapshots.drain(..) {
+                give_back(bytes);
+            }
         }
         written
     }
@@ -712,6 +850,12 @@ impl Shadow {
 
     /// [`Shadow::update`]; `lazy`: the tiles of a sparse copy that did not
     /// change the last times are looked at less often.
+    pub(crate) fn kernel_watched(&self) -> bool {
+        self.direct.is_none()
+            && self.sparse.is_none()
+            && !matches!(self.watched.load(Ordering::Relaxed), WATCHED_GUARDED | NOT_WATCHED)
+    }
+
     pub(crate) fn update_lazily(&self, address: usize, len: usize, lazy: bool) -> usize {
         if self.direct.is_some() {
             return 0;
@@ -771,8 +915,9 @@ impl Shadow {
         }
         let lazy = lazy && !forced && always != 2;
         if mode == WATCHED_GUARDED {
+            let pinned = crate::watch::any_pinned(from, to);
             let ge = crate::watch::region_epoch(from, to);
-            {
+            if !pinned {
                 let spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
                 if spans.get(&(from, to)) == Some(&ge) {
                     #[cfg(feature = "diagnostics")]
@@ -791,7 +936,7 @@ impl Shadow {
                 } else {
                     self.copy_stale(from, to, now, &written)
                 };
-                if crate::watch::region_epoch(from, to) == ge {
+                if !pinned && !crate::watch::any_pinned(from, to) && crate::watch::region_epoch(from, to) == ge {
                     let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
                     if spans.len() >= 8192 {
                         spans.clear();
@@ -825,6 +970,7 @@ impl Shadow {
                 }
                 return copied;
             }
+            let pinned = crate::watch::any_pinned(from, to);
             let ge = crate::watch::region_epoch(from, to);
             if let Some((now, written)) = crate::watch::writes_guarded_since(from, to, since) {
                 self.watched.store(WATCHED_GUARDED, Ordering::Relaxed);
@@ -833,7 +979,7 @@ impl Shadow {
                 } else {
                     self.copy_stale(from, to, now, &written)
                 };
-                if crate::watch::region_epoch(from, to) == ge {
+                if !pinned && !crate::watch::any_pinned(from, to) && crate::watch::region_epoch(from, to) == ge {
                     let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
                     if spans.len() >= 8192 {
                         spans.clear();
@@ -1337,8 +1483,8 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
     Some(window)
 }
 
-/// Where the unmapped title memory `address` is in ends, if it is.
-fn unmapped(address: usize) -> Option<usize> {
+/// Whether `address` is unmapped title memory and where its current region ends.
+fn region_state(address: usize) -> (bool, usize) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
     };
@@ -1347,11 +1493,17 @@ fn unmapped(address: usize) -> Option<usize> {
         let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
         let size = size_of_val(&info);
         if VirtualQuery(address as *const _, &mut info, size) != size {
-            return Some((address | (CHUNK as usize - 1)) + 1);
+            return (true, (address | (CHUNK as usize - 1)) + 1);
         }
-        (info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS)
-            .then(|| info.BaseAddress as usize + info.RegionSize)
+        let end = info.BaseAddress as usize + info.RegionSize;
+        (info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS, end)
     }
+}
+
+/// Where the unmapped title memory `address` is in ends, if it is.
+fn unmapped(address: usize) -> Option<usize> {
+    let (gone, end) = region_state(address);
+    gone.then_some(end)
 }
 
 /// Tiles of `[start, end)` known to have no title memory are looked at again.
@@ -1758,12 +1910,14 @@ fn sweeps() -> u8 {
 /// viewed them is gone. At the present of `frame`.
 pub(crate) fn sweep(frame: u64) {
     const EVERY: u64 = 32;
+    const MAX_SWEEP_US: u64 = 4_000;
     let mode = sweeps();
     if !frame.is_multiple_of(EVERY) || mode == 0 {
         return;
     }
     // Once a frame, whoever asks.
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SHADOW_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     if LAST.swap(frame, Ordering::Relaxed) == frame {
         return;
     }
@@ -1771,22 +1925,29 @@ pub(crate) fn sweep(frame: u64) {
     let keep: u64 = if gone_only { 600 } else { 120 };
     let mut given = 0u64;
     let started = std::time::Instant::now();
-    let all: Vec<Arc<Shadow>> = SPARSE
+    let mut all: Vec<Arc<Shadow>> = SPARSE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values()
         .flatten()
         .cloned()
         .collect();
+    if !all.is_empty() {
+        let shift = SHADOW_CURSOR.fetch_add(1, Ordering::Relaxed) % all.len();
+        all.rotate_left(shift);
+    }
     for shadow in all {
+        if started.elapsed().as_micros() as u64 >= MAX_SWEEP_US {
+            break;
+        }
         let Some(s) = &shadow.sparse else { continue };
         if !shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
             continue;
         }
         // Those old enough, taken under the lock; whether their title memory
         // is gone is asked of the system outside it, a region at a time (one
-        // question answers for every tile of an unmapped region); then those
-        // still as they were are taken out.
+        // question answers for every tile of either an unmapped or committed
+        // region); then those still as they were are taken out.
         let mut candidates: Vec<(u32, u64)> = {
             let tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
             let kept = s.kept.lock().unwrap_or_else(|e| e.into_inner());
@@ -1799,17 +1960,27 @@ pub(crate) fn sweep(frame: u64) {
         if gone_only && !candidates.is_empty() {
             candidates.sort_unstable();
             let mut gone_until = 0usize;
+            let mut alive_until = 0usize;
+            let mut timed_out = false;
             candidates.retain(|&(at, _)| {
                 let address = shadow.start as usize + at as usize * PAGE;
                 if address + PAGE <= gone_until {
                     return true;
                 }
-                match unmapped(address) {
-                    Some(end) => {
-                        gone_until = end;
-                        address + PAGE <= end
-                    }
-                    None => false,
+                if address + PAGE <= alive_until || timed_out {
+                    return false;
+                }
+                if started.elapsed().as_micros() as u64 >= MAX_SWEEP_US {
+                    timed_out = true;
+                    return false;
+                }
+                let (gone, end) = region_state(address);
+                if gone {
+                    gone_until = end;
+                    address + PAGE <= end
+                } else {
+                    alive_until = end;
+                    false
                 }
             });
         }
@@ -2965,5 +3136,56 @@ mod tests {
             (0x2000, 0),
         ]);
         assert_eq!(merged, vec![(0x1000, 0x2500), (0x4000, 0x1000)]);
+    }
+
+    #[test]
+    fn disjoint_snapshots_skip_large_gaps_and_round_trip_copy_back() {
+        let Some(host) = host() else { return };
+        const SIZE: usize = 2 << 20;
+        let title_mem = crate::resource::Memory::zeroed(SIZE as u64, 64 << 10).unwrap();
+        let (buf, data) = host.shared_buffer(SIZE as u64).unwrap();
+        // SAFETY: live resource.
+        let gpu = unsafe { buf.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buf, data, gpu, title_mem.address(), SIZE as u64, None);
+        shadow.watched.store(NOT_WATCHED, Ordering::Relaxed);
+
+        let base = title_mem.address() as usize;
+        // Initialize two distant regions (> 256 KiB gap) in title and host memory.
+        // SAFETY: both title and shared host mappings cover `SIZE` bytes.
+        unsafe {
+            *(data as *mut u32) = 10;
+            *(base as *mut u32) = 10;
+            *(data.add(SIZE - PAGE) as *mut u32) = 20;
+            *((base + SIZE - PAGE) as *mut u32) = 20;
+        }
+        shadow.writing(base, 4096);
+        shadow.writing(base + SIZE - PAGE, 4096);
+        {
+            let before = shadow.before.lock().unwrap();
+            assert_eq!(
+                before.snapshots.len(),
+                2,
+                "disjoint segments > 256 KiB apart must not copy the gap"
+            );
+            assert_eq!(before.snapshots[0].0, 0);
+            assert_eq!(before.snapshots[0].1.len(), 4096);
+            assert_eq!(before.snapshots[1].0, SIZE - PAGE);
+            assert_eq!(before.snapshots[1].1.len(), 4096);
+        }
+
+        // Simulate GPU shader writes into both host regions, then copy back.
+        // SAFETY: shared host buffer offsets lie inside `SIZE`.
+        unsafe {
+            *(data as *mut u32) = 0x1122_3344;
+            *(data.add(SIZE - PAGE) as *mut u32) = 0x5566_7788;
+        }
+        let written = shadow.copy_back_many(&[(base, 4096), (base + SIZE - PAGE, 4096)]);
+        assert_eq!(written, 8);
+        // SAFETY: valid title memory inside `title_mem`.
+        unsafe {
+            assert_eq!(*(base as *const u32), 0x1122_3344);
+            assert_eq!(*((base + SIZE - PAGE) as *const u32), 0x5566_7788);
+        }
+        assert!(shadow.before.lock().unwrap().snapshots.is_empty());
     }
 }

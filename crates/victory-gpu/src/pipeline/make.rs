@@ -388,7 +388,7 @@ fn work_for(screen: bool) -> &'static Work {
         let total = if screen {
             2
         } else {
-            std::thread::available_parallelism().map_or(4, |n| n.get().clamp(4, 12))
+            std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
         };
         let urgent_count = urgent_worker_count(screen, total);
         let mut any = false;
