@@ -20,9 +20,9 @@ intact.
 | Area | Current state |
 |------|---------------|
 | Target adapters | NVIDIA RTX 3060 Ti 8 GB (Wave32 `32-32`, capped descriptor heap fallback); prior base also ran on AMD RX 9070 XT 16 GB (Wave64) |
-| Shader translation (`shaders.rpf` -> Wave32 `32-32`) | **25,491 / 25,889** programs emit DXIL across 26,503 containers (614 duplicates skipped; 398 unsupported, see below) |
+| Shader translation (Wave32 `32-32`) | **25,491 / 25,889** programs emit DXIL across 26,503 containers in the shader archive (614 duplicates skipped; 398 unsupported, see below) |
 | Live in-game status (RTX 3060 Ti, pre-batch baseline) | Before this batch of fixes, menus dropped from `70+ fps` to `~2 fps` and in-world cutscenes showed sky/UI over black unlit geometry (`~1 fps`, `1467–2511 draws/frame`) |
-| Live in-game status (after 2026-11-26 fixes) | **Not yet re-run in `game_scarlett_master.exe` here** — verified so far by workspace builds, unit tests, D3D12 pipeline/copy tests, and offline full-archive `shaders.rpf` translation |
+| Live in-game status (after 2026-11-26 fixes) | **Not yet re-run in-game here** — verified so far by workspace builds, unit tests, D3D12 pipeline/copy tests, and offline full-archive shader translation |
 | Ray tracing (`VICTORY_RAYS`) | Disabled by default; BVH builder/wind compute passes stay skipped unless opted in |
 
 ### What this fork changes
@@ -105,10 +105,10 @@ All checks below ran with `--locked` on Windows 11 + RTX 3060 Ti (`host waves 32
 ### Known problems
 
 - **Unverified in-game visually after 2026-11-26 edits**: live playback of
-  `game_scarlett_master.exe` has not yet been re-tested after the shader,
-  pipeline-queue, `use_slot` `R9G9B9E5` sync, and placed-texture budget fixes.
-- **Wave32 unsupported console shaders**: across `shaders.rpf`, `398` of `25,889`
-  programs still fail to translate (`195` non-VS/PS/CS/MS stages, `71` mesh
+  the title has not yet been re-tested after the shader, pipeline-queue,
+  `use_slot` `R9G9B9E5` sync, and placed-texture budget fixes.
+- **Wave32 unsupported console shaders**: across the title's shader archive,
+  `398` of `25,889` programs still fail to translate (`195` non-VS/PS/CS/MS stages, `71` mesh
   shaders exceeding 32 KiB, `14` console wave64 lane ops, `8` LDS without
   barriers, and `opaque lane mask` / `conditional export` cases).
 - **Pre-existing failing tests (4 + 5 + 1)**:
@@ -258,7 +258,7 @@ For a startup breakpoint (`0x80000003`), run the diagnostics build with
 console output. The refusal is expected for DLLs outside the host policy,
 including `rpcrt4.dll`.
 
-On Series 1.0.2.1, a missing `appdata0.rpf` reproduced the breakpoint at
+On Series 1.0.2.1, a missing RPF9 data archive reproduced the breakpoint at
 `+0x2237178` before the first window. Restore the archive from the same
 package beside the title executable. `run --execute` checks that it can
 read the RPF9 header before starting this build.
