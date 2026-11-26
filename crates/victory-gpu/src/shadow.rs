@@ -307,13 +307,7 @@ impl Shadow {
         let start = self.start as usize;
         let shadow_len = self.len as usize;
         let mode = self.watched.load(Ordering::Relaxed);
-        let mut written = 0usize;
-        let mut title_buf = pooled(PAGE);
-        title_buf.resize(PAGE, 0);
-        let mut synced_pages: Vec<usize> = Vec::new();
-        let mut min_addr = usize::MAX;
-        let mut max_addr = 0usize;
-
+        let mut work: Vec<(usize, usize)> = Vec::new();
         for &(first_piece, count, rb_ptr) in runs {
             for k in 0..count {
                 let piece = (first_piece + k) as usize;
@@ -321,13 +315,30 @@ impl Shadow {
                 if off >= shadow_len {
                     break;
                 }
+                work.push((off, rb_ptr + (k as usize) * PAGE));
+            }
+        }
+        if work.is_empty() {
+            return 0;
+        }
+        let written = std::sync::atomic::AtomicUsize::new(0);
+        let merged_sync: std::sync::Mutex<(Vec<usize>, Vec<(usize, usize)>, usize, usize)> =
+            std::sync::Mutex::new((Vec::new(), Vec::new(), usize::MAX, 0));
+        crate::host::in_parallel(&work, 4, |chunk| {
+            let mut title_buf = pooled(PAGE);
+            title_buf.resize(PAGE, 0);
+            let mut local_written = 0usize;
+            let mut local_pages = Vec::new();
+            let mut local_dirty = Vec::new();
+            let mut local_min = usize::MAX;
+            let mut local_max = 0usize;
+            for &(off, rb_slice_ptr) in chunk {
                 let n = PAGE.min(shadow_len - off);
                 let title_addr = start + off;
-                // SAFETY: `rb_ptr` holds `count * PAGE` bytes fetched from VRAM;
-                // `self.data` maps `card.staging` of at least `shadow_len` bytes.
-                let gpu_new = unsafe {
-                    std::slice::from_raw_parts((rb_ptr + (k as usize) * PAGE) as *const u8, n)
-                };
+                // SAFETY: `rb_slice_ptr` holds `n` bytes fetched from VRAM;
+                // each piece in `work` covers a distinct `[off, off + PAGE)` slice
+                // of `card.staging` (`self.data`), so disjoint workers never alias.
+                let gpu_new = unsafe { std::slice::from_raw_parts(rb_slice_ptr as *const u8, n) };
                 let staging_old =
                     unsafe { std::slice::from_raw_parts_mut(self.data.add(off), n) };
                 if gpu_new == staging_old {
@@ -335,8 +346,6 @@ impl Shadow {
                 }
                 let title_slice = &mut title_buf[..n];
                 if !crate::host::read_into(title_addr as *const u8, title_slice) {
-                    // Unmapped in title memory: still sync staging to VRAM so
-                    // future diffs compare against the latest GPU bytes.
                     staging_old.copy_from_slice(gpu_new);
                     continue;
                 }
@@ -352,23 +361,36 @@ impl Shadow {
                         title_slice[dirty_start..].as_ptr(),
                         dirty_len,
                     );
-                    written += dirty_len;
+                    local_written += dirty_len;
                 }
                 if cpu_modified {
-                    // Concurrent CPU write on the same page: upload merged
-                    // `staging` back to VRAM before the next submission.
-                    card.mark_dirty(off, off + n);
+                    local_dirty.push((off, off + n));
                 }
                 let page_lo = title_addr.div_ceil(PAGE);
                 let page_hi = (title_addr + n) / PAGE;
                 for p in page_lo..page_hi {
-                    synced_pages.push(p);
+                    local_pages.push(p);
                 }
-                min_addr = min_addr.min(title_addr);
-                max_addr = max_addr.max(title_addr + n);
+                local_min = local_min.min(title_addr);
+                local_max = local_max.max(title_addr + n);
             }
+            give_back(title_buf);
+            if local_written > 0 {
+                written.fetch_add(local_written, Ordering::Relaxed);
+            }
+            if !local_pages.is_empty() || !local_dirty.is_empty() {
+                let mut g = merged_sync.lock().unwrap_or_else(|e| e.into_inner());
+                g.0.extend(local_pages);
+                g.1.extend(local_dirty);
+                g.2 = g.2.min(local_min);
+                g.3 = g.3.max(local_max);
+            }
+        });
+        let (synced_pages, dirty_up, min_addr, max_addr) = merged_sync.into_inner().unwrap();
+        for (lo, hi) in dirty_up {
+            card.mark_dirty(lo, hi);
         }
-        give_back(title_buf);
+        let written = written.into_inner();
 
         if !synced_pages.is_empty() && mode != NOT_WATCHED && min_addr < max_addr {
             let (first, last) = (min_addr.div_ceil(PAGE), max_addr / PAGE);
@@ -762,8 +784,13 @@ impl Shadow {
                     return 0;
                 }
             }
-            if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
-                let copied = self.copy_stale(from, to, now, &written);
+            let since = self.min_copied(from, to);
+            if let Some((now, written)) = crate::watch::writes_guarded_since(from, to, since) {
+                let copied = if since > 0 && written.is_empty() {
+                    0
+                } else {
+                    self.copy_stale(from, to, now, &written)
+                };
                 if crate::watch::region_epoch(from, to) == ge {
                     let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
                     if spans.len() >= 8192 {
@@ -782,9 +809,14 @@ impl Shadow {
         } else if mode != NOT_WATCHED {
             // Probe write-watch first; if that fails and guard succeeds, mark
             // this shadow as guarded so subsequent calls skip GetWriteWatch.
-            if let Some((now, written)) = crate::watch::writes(from, to, false) {
+            let since = self.min_copied(from, to);
+            if let Some((now, written)) = crate::watch::writes_since(from, to, false, since) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = if since > 0 && written.is_empty() {
+                    0
+                } else {
+                    self.copy_stale(from, to, now, &written)
+                };
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -794,9 +826,13 @@ impl Shadow {
                 return copied;
             }
             let ge = crate::watch::region_epoch(from, to);
-            if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
+            if let Some((now, written)) = crate::watch::writes_guarded_since(from, to, since) {
                 self.watched.store(WATCHED_GUARDED, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = if since > 0 && written.is_empty() {
+                    0
+                } else {
+                    self.copy_stale(from, to, now, &written)
+                };
                 if crate::watch::region_epoch(from, to) == ge {
                     let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
                     if spans.len() >= 8192 {
@@ -844,25 +880,73 @@ impl Shadow {
     /// looked at after 2, 4 and at most 16 frames, unless something new reads
     /// it: the title fills memory, then makes views of it.
     fn copy_tiles(&self, s: &Sparse, from: usize, to: usize, frame: u64, lazy: bool) -> usize {
+        const CHUNK: usize = 8 * PAGE; // 512 KiB parallel units (disjoint 64 KiB tiles)
+        if !cfg!(test) && to.saturating_sub(from) >= CHUNK {
+            let start = self.start as usize;
+            let mut spans = Vec::new();
+            let mut at = from;
+            while at < to {
+                let tile_start = start + ((at - start) / PAGE) * PAGE;
+                let next = tile_start.saturating_add(CHUNK).min(to);
+                spans.push((at, next));
+                at = next;
+            }
+            let total = std::sync::atomic::AtomicUsize::new(0);
+            crate::host::in_parallel(&spans, 1, |chunk| {
+                let mut sum = 0usize;
+                for &(a, b) in chunk {
+                    sum += self.copy_tiles_range(s, a, b, frame, lazy);
+                }
+                if sum > 0 {
+                    total.fetch_add(sum, Ordering::Relaxed);
+                }
+            });
+            return total.into_inner();
+        }
+        self.copy_tiles_range(s, from, to, frame, lazy)
+    }
+
+    fn copy_tiles_range(
+        &self,
+        s: &Sparse,
+        from: usize,
+        to: usize,
+        frame: u64,
+        lazy: bool,
+    ) -> usize {
+        if from >= to {
+            return 0;
+        }
         thread_local! {
             static READ: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0; PAGE]);
         }
+        let start = self.start as usize;
+        let first_tile = ((from - start) / PAGE) as u32;
+        let last_tile = ((to - 1 - start) / PAGE) as u32;
+        // Acquire per-tile Look handles in one outer lock acquisition instead of per 64 KiB page.
+        let tile_looks: Vec<(u32, Arc<Mutex<Look>>)> = {
+            let mut looks = s.looks.lock().unwrap_or_else(|e| e.into_inner());
+            (first_tile..=last_tile)
+                .map(|t| (t, looks.entry(t).or_default().clone()))
+                .collect()
+        };
         let mut bytes = 0;
         // The title's unmapped memory found last: tiles of it have no memory
         // here either (reads give zeros). Tens of thousands of tiles a frame
         // were zeros copied, 1.4 GB of them.
         let mut hole = 0..0;
+        let mut idx = 0usize;
+        let _ = &mut idx;
         let mut at = from;
         while at < to {
-            let n = (PAGE - at % PAGE).min(to - at);
+            let n = (PAGE - (at - start) % PAGE).min(to - at);
             let next = at + n;
-            let tile = ((at - self.start as usize) / PAGE) as u32;
-            let whole = at - at % PAGE..at - at % PAGE + PAGE;
-            let look = {
-                let mut looks = s.looks.lock().unwrap_or_else(|e| e.into_inner());
-                looks.entry(tile).or_default().clone()
-            };
-            let mut look = look.lock().unwrap_or_else(|e| e.into_inner());
+            let rel_tile = (at - start) / PAGE;
+            let (tile, look_arc) = &tile_looks[rel_tile - first_tile as usize];
+            let tile = *tile;
+            let tile_base = start + rel_tile * PAGE;
+            let whole = tile_base..tile_base + PAGE;
+            let mut look = look_arc.lock().unwrap_or_else(|e| e.into_inner());
             if lazy && n == PAGE && frame < look.next || look.hole && frame < look.next {
                 at = next;
                 continue;
@@ -936,6 +1020,22 @@ impl Shadow {
             at = next;
         }
         bytes
+    }
+
+    /// Lowest copy timestamp across pages covering `[from, to)` (`0` if any page
+    /// has never been copied yet).
+    fn min_copied(&self, from: usize, to: usize) -> u64 {
+        if from >= to {
+            return 0;
+        }
+        let base = self.start as usize / PAGE;
+        let first = (from / PAGE).saturating_sub(base);
+        let last = ((to - 1) / PAGE).saturating_sub(base);
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        copied
+            .get(first..=last)
+            .and_then(|s| s.iter().copied().min())
+            .unwrap_or(0)
     }
 
     /// Copies the pages of `[from, to)` written after their last copy

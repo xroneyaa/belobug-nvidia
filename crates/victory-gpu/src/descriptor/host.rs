@@ -221,8 +221,8 @@ struct Bindless {
 const SLOT_BUDGET_US: u64 = 20_000;
 /// Slots taken to make at once (the rest wait without being looked at).
 const SLOT_CHUNK: usize = 512;
-/// Slots made at each submission whatever time they take.
-const URGENT: usize = 2048;
+/// Urgent slots favored each submission before yielding to `SLOT_BUDGET_US`.
+const URGENT: usize = 256;
 
 impl Bindless {
     /// The slot-making budget, refilled for the time passed since.
@@ -1807,7 +1807,12 @@ impl HostHeap {
         let mut todo = todo.into_iter();
         let mut count = 0usize;
         for (index, entry) in todo.by_ref() {
-            if count >= exempt && (count & 15) == 0 && started.elapsed().as_micros() as u64 > left {
+            let cap = if count < exempt {
+                left.saturating_mul(2).max(40_000)
+            } else {
+                left
+            };
+            if (count & 15) == 0 && started.elapsed().as_micros() as u64 > cap {
                 // Over budget: the rest waits for the next submission.
                 over = Some(index);
                 break;

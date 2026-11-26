@@ -914,7 +914,7 @@ impl CardEngine {
                         }
                     }
                     let total_written = AtomicU64::new(0);
-                    crate::host::in_parallel(&per_entry, 4, |chunk| {
+                    crate::host::in_parallel(&per_entry, 1, |chunk| {
                         for (entry_idx, runs) in chunk {
                             let entry = &plan.entries[*entry_idx];
                             let n = entry.shadow.merge_card_pieces(&entry.card, runs);

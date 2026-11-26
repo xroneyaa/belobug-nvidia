@@ -528,13 +528,26 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Writes the library and the early list when `min_added` new pipelines were
+/// stored since the last save and `SAVE_EVERY` has passed (or immediately when
+/// `now` is true).
 pub(crate) fn save(now: bool) {
+    save_with(now, if now { 1 } else { 1 }, std::time::Duration::from_secs(20));
+}
+
+/// Periodic save called from background workers: skips serializing the full
+/// library until at least `PERIODIC_MIN_ADDED` pipelines accumulate so multi-hundred-MB
+/// `Serialize` passes do not stall shader compilation workers every 20 seconds.
+pub(crate) fn save_periodic() {
+    const PERIODIC_MIN_ADDED: u64 = 64;
+    const PERIODIC_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+    save_with(false, PERIODIC_MIN_ADDED, PERIODIC_EVERY);
+}
+
+fn save_with(now: bool, min_added: u64, every: std::time::Duration) {
     // Held over serialisation and both writes, so overlapping saves cannot
     // replace files under each other.
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     let mut last = if now {
         LAST.lock().unwrap_or_else(|e| e.into_inner())
@@ -545,23 +558,25 @@ pub(crate) fn save(now: bool) {
             Err(std::sync::TryLockError::WouldBlock) => return,
         }
     };
-    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+    if !now && last.is_some_and(|t| t.elapsed() < every) {
         return;
     }
-    *last = Some(std::time::Instant::now());
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        tracing::warn!(error = %e, "host pipeline cache dir not created");
-        return;
-    }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     let (bytes_written, saved_additions) = {
         let l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !USED_CHANGED.load(Ordering::Relaxed) {
+        let serialize_library = l.added >= min_added && l.added > 0;
+        let used_dirty = USED_CHANGED.load(Ordering::Relaxed);
+        if !serialize_library && !used_dirty {
             return;
         }
-        if l.added == 0 {
+        *last = Some(std::time::Instant::now());
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(error = %e, "host pipeline cache dir not created");
+            return;
+        }
+        if !serialize_library {
             (0, 0)
         } else {
+            let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
             // SAFETY: a plain query.
             let size = unsafe { l.library.GetSerializedSize() };
             if let Err(e) = serialise(&l.library, &tmp, size) {
@@ -572,6 +587,7 @@ pub(crate) fn save(now: bool) {
             (size, l.added)
         }
     };
+    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let library_written = if bytes_written > 0 {

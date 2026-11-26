@@ -21,8 +21,8 @@ intact.
 |------|---------------|
 | Target adapters | NVIDIA RTX 3060 Ti 8 GB (Wave32 `32-32`, capped descriptor heap fallback); prior base also ran on AMD RX 9070 XT 16 GB (Wave64) |
 | Shader translation (Wave32 `32-32`) | **25,491 / 25,889** programs emit DXIL across 26,503 containers in the shader archive (614 duplicates skipped; 398 unsupported, see below) |
-| Live in-game status (RTX 3060 Ti, pre-batch baseline) | Before this batch of fixes, menus dropped from `70+ fps` to `~2 fps` and in-world cutscenes showed sky/UI over black unlit geometry (`~1 fps`, `1467–2511 draws/frame`) |
-| Live in-game status (after 2026-11-26 fixes) | **Not yet re-run in-game here** — verified so far by workspace builds, unit tests, D3D12 pipeline/copy tests, and offline full-archive shader translation |
+| Live in-game status (RTX 3060 Ti, before CPU/FPS pass) | Initial Wave32/descriptor fixes brought world geometry, grass, trees, fences, and power lines onto screen (`706–3971 draws/frame`), though overexposed lighting halos remained and world frames ran at `0.2–1.3 fps` (`2.1–20.5 ms` GPU vs `2.4–6.1 s` CPU/wait overhead) with menu/transition stalls |
+| Live in-game status (after 2026-11-26 FPS pass) | **Not yet re-run in-game here** — verified by workspace builds, unit/D3D12 tests (`victory-gpu`: 133 passed), and ready in `target\release\victory.exe` / `target\diag\victory.exe` |
 | Ray tracing (`VICTORY_RAYS`) | Disabled by default; BVH builder/wind compute passes stay skipped unless opted in |
 
 ### What this fork changes
@@ -46,36 +46,50 @@ intact.
   on capped heaps (`2^18` dynamic slots), instead of failing shader translation
   or faulting out-of-bounds descriptors.
 
-#### Pipeline queue, descriptor sync & VRAM/commit fixes (`victory-gpu`)
-- **Graphics-first pipeline scheduling (`crates/victory-gpu/src/pipeline/make.rs`)**:
+#### Pipeline queue, descriptor sync, CPU FPS & VRAM/commit fixes (`victory-gpu`)
+- **Graphics-first non-stalling pipeline scheduling (`crates/victory-gpu/src/pipeline/make.rs`, `library.rs`)**:
   splits urgent pipeline compilation into `urgent_graphics` (`graphics.is_some()`,
-  preempting compute) and `urgent_compute`; marks pipelines used
+  preempting compute) and `urgent_compute`; scales pipeline workers to `4..=12`
+  (dedicating `total / 3` normal-priority urgent workers); marks pipelines used
   (`library::note_used`) before `enqueue`/`wait` so unbuilt urgent PSOs are not
-  evicted prematurely; keeps background 20 s cache saves (`library::save(false)`)
-  running even under urgent queue load; bounds frame waits via
-  `VICTORY_PIPELINE_WAIT_MS` (default `500` ms) and `VICTORY_PIPELINE_WAIT_SHARED`
+  evicted prematurely; defers periodic 250+ MB `Serialize` disk saves until
+  `>= 64` new pipelines accumulate and no urgent queue is active (`save_periodic`,
+  still saving small batches on drain/exit); bounds frame waits via
+  `VICTORY_PIPELINE_WAIT_MS` (default `150` ms) and `VICTORY_PIPELINE_WAIT_SHARED`
   (`0` disables shared per-kind budget).
 - **`R9G9B9E5_SHAREDEXP` copy-bridge & descriptor sync (`descriptor/host.rs`, `draw.rs`, `host.rs`)**:
   uses a D3D12 buffer-bridge copy fallback for `R9G9B9E5_SHAREDEXP` (DXGI
   format `42`) via shared `HostHeap::placed_raw_texture` across both bindless
-  (`resolve_placed`) and root-table (`use_slot`) descriptor paths, and flushes
-  dirty shared-exponent copies at the end of `HostContext::bind` so both
-  bindless and `Root::Table` draws see updated textures.
-- **8 GB placed texture budget & lazy host textures (`resource.rs`, `texture.rs`, `059b5fd`)**:
+  (`resolve_placed`) and root-table (`use_slot`) descriptor paths; flushes
+  dirty shared-exponent copies at the end of `HostContext::bind`; caps `URGENT`
+  bindless slot bursts (`256` + bounded time budget) so `bindless_plan` does
+  not stall multi-second frames; and keeps small draw root-constant assembly on
+  the stack in `draw.rs`.
+- **8 GB placed texture budget, eviction backoff & batched commitment (`resource.rs`, `texture.rs`, `059b5fd`)**:
   tracks active cached placed textures in `PLACED_CACHE_BYTES` and evicts idle
-  placed textures by `HostTexture::used` (`evict_idle_placed_to`) before
-  rejecting `texture_at` over budget, while keeping deferred retirement
-  (`PLACED_BYTES`) intact.
-- **Coalesced copy-back & sparse alignment guard (`host.rs`, `shadow.rs`, `61e1e4b`)**:
-  groups `finish_submission` copy-backs by `Shadow` and merges overlapping or
-  adjacent ranges (`merge_back_ranges`, `copy_back_many`, `sparse_back_many`),
-  and adds an early `gcd_u64` impossible-alignment check in `sparse_on_element`
+  placed textures by `HostTexture::used` (`evict_idle_placed_to`) with a
+  4-frame CAS backoff (`try_evict_budget_with_backoff`) when active textures
+  fill the budget so `texture_at` misses do not repeatedly scan ~38,000 entries;
+  replaces exception-faulting per-64-KiB probes in `committed` with batched
+  `K32QueryWorkingSetEx` checks (`committed_blocks`); and parallelizes texture
+  staging refreshes in `Early::take` and `HostList::run_deferred`.
+- **Parallel copy/copy-back & sparse tile batching (`host.rs`, `shadow.rs`, `card.rs`, `61e1e4b`)**:
+  adds a nested-parallelism guard to `host::in_parallel`; parallelizes
+  `Batch::flush` (`Step::Refresh`/`pieces` grouped per root copy),
+  `prepare_bindless` `reads` (`least = 1`), `finish_submission` copy-back
+  groups (`least = 1`), `card::finish_back` entries (`least = 1`), and
+  `merge_card_pieces` across dirty 64 KiB pages; batches `s.looks` locking and
+  splits `>= 512 KiB` `copy_tiles` spans into parallel page-disjoint chunks;
+  and merges overlapping copy-backs (`merge_back_ranges`, `copy_back_many`,
+  `sparse_back_many`) with an early `gcd_u64` check in `sparse_on_element`
   without reintroducing blocking `memory_pressure()`/`sweep_now()` calls.
-- **Multi-view write-watch coherence (`watch.rs`)**:
+- **Multi-view & incremental write-watch coherence (`watch.rs`, `shadow.rs`, `texture.rs`)**:
   unifies `guard` fast and slow paths (preserving active `pins`,
-  `bump_region_epochs`, clean-range skips, and `holes` checks) and clears
+  `bump_region_epochs`, clean-range skips, and `holes` checks), clears
   overlapping `pins` and stale `JOURNAL.written` timestamps in
-  `title_memory_remapped`.
+  `title_memory_remapped`, and adds `writes_since` / `writes_guarded_since`
+  with per-`Shadow` `min_copied` watermarks and `Staging` timestamps to skip
+  allocating/scanning historical writes when pages have not changed.
 
 #### Upstream `Belobug` & inherited features retained
 - Fallback ambient lighting (`VICTORY_AMBIENT`, `VICTORY_AMBIENT_TINT`,
@@ -94,7 +108,8 @@ All checks below ran with `--locked` on Windows 11 + RTX 3060 Ti (`host waves 32
 
 - `cargo check --workspace --all-targets --locked`: **passed**
 - `cargo build --release --locked` and `cargo build --profile diag -p victory --features diagnostics --locked`: **passed**
-- Passing suites (`0` failed): `victory-gpu` (`130 passed; 4 ignored`),
+- `victory-gpu` (`-- --test-threads=1`, run after the latest edits): **`133 passed; 0 failed; 4 ignored`**
+- Other unchanged passing crates (last run prior to the `victory-gpu` CPU/FPS pass):
   `victory` (`1 passed`), `victory-core` (`11 passed`), `victory-formats`
   (`24 passed; 4 ignored`), `victory-game` (`2 passed`), `victory-pe`
   (`7 passed`), `victory-pipeline` (`4 passed`), `victory-loader`
@@ -104,9 +119,10 @@ All checks below ran with `--locked` on Windows 11 + RTX 3060 Ti (`host waves 32
 
 ### Known problems
 
-- **Unverified in-game visually after 2026-11-26 edits**: live playback of
-  the title has not yet been re-tested after the shader, pipeline-queue,
-  `use_slot` `R9G9B9E5` sync, and placed-texture budget fixes.
+- **Unverified in-game after the latest CPU/FPS pass**: live playback of the
+  title has not yet been re-tested with these CPU/FPS optimizations, and
+  overexposed/neon world lighting halos seen in the prior run remain to be
+  investigated once live frame rate reaches `1–3+ fps`.
 - **Wave32 unsupported console shaders**: across the title's shader archive,
   `398` of `25,889` programs still fail to translate (`195` non-VS/PS/CS/MS stages, `71` mesh
   shaders exceeding 32 KiB, `14` console wave64 lane ops, `8` LDS without

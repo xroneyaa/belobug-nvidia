@@ -110,12 +110,39 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     found: Vec::new(),
 });
 
+fn collect_since(
+    written: &BTreeMap<usize, u64>,
+    first: usize,
+    last: usize,
+    since: u64,
+) -> Vec<(usize, u64)> {
+    if since == 0 {
+        written.range(first..last).map(|(&p, &w)| (p, w)).collect()
+    } else {
+        written
+            .range(first..last)
+            .filter_map(|(&p, &w)| (w > since).then_some((p, w)))
+            .collect()
+    }
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_since(start, end, guarded, 0)
+}
+
+/// Same as [`writes`], omitting page entries whose last write is at or before
+/// `since` (`0` returns every recorded write).
+pub(crate) fn writes_since(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    since: u64,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -154,23 +181,33 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    let mut prev_page = usize::MAX;
+    for &at in &j.found[..count] {
+        let page = at / PAGE;
+        if page != prev_page {
+            j.written.insert(page, now);
+            prev_page = page;
+        }
+    }
+    for page in guarded {
         j.written.insert(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some((now, collect_since(&j.written, first, last, since)))
 }
 
 /// Same as [`writes`] for memory already known to be guarded `MEM_MAPPED`
 /// view memory: skips the `GetWriteWatch` syscall (which always fails on
 /// mapped views).
 pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_guarded_since(start, end, 0)
+}
+
+/// Same as [`writes_guarded`], omitting entries with write timestamp `<= since`.
+pub(crate) fn writes_guarded_since(
+    start: usize,
+    end: usize,
+    since: u64,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -188,13 +225,7 @@ pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usiz
     for page in guarded {
         j.written.insert(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some((now, collect_since(&j.written, first, last, since)))
 }
 
 /// Guarded blocks of view memory.
@@ -1117,5 +1148,38 @@ mod tests {
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    #[test]
+    fn writes_since_filters_stale_journal_entries() {
+        // SAFETY: private write-watched reservation freed at the end of the test.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * BLOCK,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        // SAFETY: committed write-watched memory.
+        unsafe { (base as *mut u8).write_volatile(1) };
+        let (t1, w1) = writes_since(base, base + 2 * BLOCK, false, 0).expect("write watch");
+        assert_eq!(w1, vec![(base / PAGE, t1)]);
+
+        // Unchanged range returns no entries once `since == t1`.
+        let (t2, w2) = writes_since(base, base + 2 * BLOCK, false, t1).expect("write watch");
+        assert!(t2 > t1);
+        assert!(w2.is_empty());
+
+        // Writing block 1 reports only block 1 after `t2`.
+        // SAFETY: committed write-watched memory.
+        unsafe { ((base + BLOCK) as *mut u8).write_volatile(2) };
+        let (t3, w3) = writes_since(base, base + 2 * BLOCK, false, t2).expect("write watch");
+        assert_eq!(w3, vec![((base + BLOCK) / PAGE, t3)]);
+
+        title_memory_remapped(base, 2 * BLOCK);
+        // SAFETY: allocation owned by this test.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 }

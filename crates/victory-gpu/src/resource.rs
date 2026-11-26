@@ -2166,6 +2166,29 @@ fn evict_idle_placed_to(target_bytes: u64, now: u64) -> usize {
     count
 }
 
+#[cfg(windows)]
+fn try_evict_budget_with_backoff(
+    now: u64,
+    next_frame: &std::sync::atomic::AtomicU64,
+    target_bytes: u64,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let next = next_frame.load(Ordering::Relaxed);
+    if now < next
+        || next_frame
+            .compare_exchange(next, now.saturating_add(4), Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+    {
+        return false;
+    }
+    evict_idle_placed_to(target_bytes, now);
+    if !placed_budget_allows() {
+        return false;
+    }
+    next_frame.store(0, Ordering::Release);
+    true
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
@@ -2197,9 +2220,15 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
         }
     }
     if !placed_budget_allows() {
+        static EVICT_NEXT_FRAME: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let limit = placed_budget_bytes();
-        evict_idle_placed_to(limit.saturating_sub(limit / 8), crate::queue::presented());
-        if !placed_budget_allows() {
+        if !try_evict_budget_with_backoff(
+            crate::queue::presented(),
+            &EVICT_NEXT_FRAME,
+            limit.saturating_sub(limit / 8),
+        ) {
+            // Budget remains full (active/recent textures hold it) or backoff is active.
             return None;
         }
     }
@@ -3554,5 +3583,22 @@ mod tests {
 
         super::evict_placed_textures(fresh_addr, fresh_addr + fresh_buf.len() as u64);
         assert!(!super::has_placed_texture(fresh_addr, &words));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn placed_eviction_backoff_skips_repeat_scans_within_window() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let next = AtomicU64::new(0);
+        // Reserve one backoff slot at frame 10; repeated attempts before frame 14 skip.
+        assert!(
+            next.compare_exchange(0, 14, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        );
+        assert!(!super::try_evict_budget_with_backoff(10, &next, u64::MAX));
+        assert!(!super::try_evict_budget_with_backoff(13, &next, u64::MAX));
+        // Once frame reaches 14, `placed_budget_allows()` is true in tests so backoff resets.
+        assert!(super::try_evict_budget_with_backoff(14, &next, u64::MAX));
+        assert_eq!(next.load(Ordering::Relaxed), 0);
     }
 }

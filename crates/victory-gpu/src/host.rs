@@ -1583,7 +1583,7 @@ impl Host {
                     COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
                 }
             } else {
-                in_parallel(&groups, 8, |chunk| {
+                in_parallel(&groups, 1, |chunk| {
                     for (shadow, ranges) in chunk {
                         let written = shadow.copy_back_many(ranges);
                         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
@@ -2978,6 +2978,40 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         let mut uploads = Vec::new();
+        let mut pending_textures: Vec<(
+            std::sync::Arc<crate::texture::Staging>,
+            std::sync::Arc<crate::resource::HostTexture>,
+        )> = Vec::new();
+        let flush_textures =
+            |pending: &mut Vec<(
+                std::sync::Arc<crate::texture::Staging>,
+                std::sync::Arc<crate::resource::HostTexture>,
+            )>,
+             uploads: &mut Vec<(
+                std::sync::Arc<crate::texture::Staging>,
+                std::sync::Arc<crate::resource::HostTexture>,
+            )>| {
+                if pending.is_empty() {
+                    return;
+                }
+                let batch_list = std::mem::take(pending);
+                let dirty: Vec<std::sync::atomic::AtomicBool> = (0..batch_list.len())
+                    .map(|_| std::sync::atomic::AtomicBool::new(false))
+                    .collect();
+                let indices: Vec<usize> = (0..batch_list.len()).collect();
+                in_parallel(&indices, 2, |chunk| {
+                    for &i in chunk {
+                        if batch_list[i].0.refresh() {
+                            dirty[i].store(true, Ordering::Relaxed);
+                        }
+                    }
+                });
+                for ((staging, copy), flag) in batch_list.into_iter().zip(dirty) {
+                    if flag.into_inner() {
+                        uploads.push((staging, copy));
+                    }
+                }
+            };
         let deferred = self.deferred();
         for (heap, writes) in &deferred.bindless {
             batch.bindless(heap, *writes);
@@ -2993,6 +3027,7 @@ impl HostList {
         for step in &deferred.copies {
             match step {
                 &Step::Copy(dst, src, len) => {
+                    flush_textures(&mut pending_textures, &mut uploads);
                     #[cfg(feature = "diagnostics")]
                     {
                         copy_count += 1;
@@ -3022,6 +3057,7 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                 }
                 Step::Run(work) | Step::Host(work) => {
+                    flush_textures(&mut pending_textures, &mut uploads);
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
@@ -3040,12 +3076,13 @@ impl HostList {
                     shadow.writing(*address, *len);
                 }
                 Step::Texture(staging, copy) => {
-                    if batch.texture_due(staging) && staging.refresh() {
-                        uploads.push((staging.clone(), copy.clone()));
+                    if batch.texture_due(staging) {
+                        pending_textures.push((staging.clone(), copy.clone()));
                     }
                 }
             }
         }
+        flush_textures(&mut pending_textures, &mut uploads);
         if copy_bytes > 0 || copy_us > 0 {
             PREPARING[0].fetch_add(copy_us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copy_bytes, Ordering::Relaxed);
@@ -3133,12 +3170,26 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in std::mem::take(&mut self.refreshes) {
-            update(&shadow, from, to - from);
+        let refreshes = std::mem::take(&mut self.refreshes);
+        let mut per_shadow: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
+            Vec::new();
+        for (shadow, from, to) in refreshes {
+            per_shadow.push((shadow, vec![(from, to - from)]));
         }
         let mut pieces = std::mem::take(&mut self.pieces);
         pieces.sort_unstable_by_key(|(s, from, _)| (s.root_key(), *from));
         let mut run: Option<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = None;
+        let mut push_piece = |shadow: std::sync::Arc<crate::shadow::Shadow>, a: usize, b: usize| {
+            let len = b - a;
+            if let Some(g) = per_shadow
+                .iter_mut()
+                .find(|(s, _)| s.root_key() == shadow.root_key())
+            {
+                g.1.push((a, len));
+            } else {
+                per_shadow.push((shadow, vec![(a, len)]));
+            }
+        };
         for (shadow, from, to) in pieces {
             if let Some((s, _, end)) = &mut run
                 && s.root_key() == shadow.root_key()
@@ -3148,12 +3199,22 @@ impl Batch {
                 continue;
             }
             if let Some((s, a, b)) = run.replace((shadow, from, to)) {
-                update(&s, a, b - a);
+                push_piece(s, a, b);
             }
         }
         if let Some((s, a, b)) = run {
-            update(&s, a, b - a);
+            push_piece(s, a, b);
         }
+        if per_shadow.is_empty() {
+            return;
+        }
+        in_parallel(&per_shadow, 1, |groups| {
+            for (shadow, spans) in groups {
+                for &(addr, len) in spans {
+                    update(shadow, addr, len);
+                }
+            }
+        });
     }
 
     /// After every list's steps (no title copy follows): each directly
@@ -3174,7 +3235,7 @@ impl Batch {
             if !reads.is_empty() {
                 let started = std::time::Instant::now();
                 let copied = std::sync::atomic::AtomicU64::new(0);
-                in_parallel(reads, 8, |reads| {
+                in_parallel(reads, 1, |reads| {
                     for (shadow, address, len) in reads {
                         #[cfg(feature = "diagnostics")]
                         {
@@ -3233,13 +3294,31 @@ impl Early {
                 used.extend(states.values().map(|s| std::sync::Arc::as_ptr(&s.2) as usize));
             }
         }
+        let due: Vec<_> = first
+            .into_iter()
+            .filter(|(staging, copy)| {
+                !used.contains(&(std::sync::Arc::as_ptr(copy) as usize))
+                    && batch.texture_due(staging)
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        let dirty: Vec<std::sync::atomic::AtomicBool> = (0..due.len())
+            .map(|_| std::sync::atomic::AtomicBool::new(false))
+            .collect();
+        let indices: Vec<usize> = (0..due.len()).collect();
+        in_parallel(&indices, 2, |chunk| {
+            for &i in chunk {
+                if due[i].0.refresh() {
+                    dirty[i].store(true, Ordering::Relaxed);
+                }
+            }
+        });
         const COPY_DEST: i32 = D3D12_RESOURCE_STATE_COPY_DEST.0;
         const SHADER_RESOURCE: u32 = 0x40 | 0x80;
-        for (staging, copy) in first {
-            if used.contains(&(std::sync::Arc::as_ptr(&copy) as usize))
-                || !batch.texture_due(&staging)
-                || !staging.refresh()
-            {
+        for ((staging, copy), flag) in due.into_iter().zip(dirty) {
+            if !flag.into_inner() {
                 continue;
             }
             let real = copy.state.swap(SHADER_RESOURCE, Ordering::Relaxed) as i32;
@@ -3302,15 +3381,28 @@ impl Early {
 }
 
 /// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
+/// Nested calls inside an already-parallel worker execute inline so thread
+/// pools never oversubscribe recursively.
 pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + Sync) {
     const THREADS: usize = 6;
-    if list.len() <= least {
+    thread_local! {
+        static ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if list.len() <= least || ACTIVE.with(|a| a.get()) {
         return f(list);
     }
     // Small pieces, taken in turn: they are not equally long to do.
     let piece = (list.len() / (THREADS * 8)).max(least);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let work = || {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ACTIVE.with(|a| a.set(false));
+            }
+        }
+        ACTIVE.with(|a| a.set(true));
+        let _reset = Reset;
         loop {
             let from = next.fetch_add(piece, Ordering::Relaxed);
             if from >= list.len() {

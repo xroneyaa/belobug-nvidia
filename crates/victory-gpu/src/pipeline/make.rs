@@ -122,7 +122,7 @@ fn wait_budget() -> Duration {
         let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(500);
+            .unwrap_or(150);
         tracing::info!(millis, "host pipeline wait budget per frame");
         Duration::from_millis(millis)
     })
@@ -366,6 +366,8 @@ static AT_WORK: Mutex<Vec<ActiveWorker>> = Mutex::new(Vec::new());
 fn urgent_worker_count(screen: bool, total: usize) -> usize {
     if screen {
         usize::from(total >= 2)
+    } else if total >= 6 {
+        total / 3
     } else if total >= 3 {
         2
     } else {
@@ -386,7 +388,7 @@ fn work_for(screen: bool) -> &'static Work {
         let total = if screen {
             2
         } else {
-            std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+            std::thread::available_parallelism().map_or(4, |n| n.get().clamp(4, 12))
         };
         let urgent_count = urgent_worker_count(screen, total);
         let mut any = false;
@@ -404,11 +406,14 @@ fn work_for(screen: bool) -> &'static Work {
 /// Starts worker `i` with `role`, returning whether the thread spawned.
 fn worker(i: usize, role: Role) -> bool {
     let spawned = std::thread::Builder::new().name(format!("victory-pipelines-{i}")).spawn(move || {
-        // Below the title's own threads (loading, recording).
-        // SAFETY: a plain call on our own thread.
-        unsafe {
-            use windows::Win32::System::Threading::*;
-            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        // Urgent-only workers stay at normal priority so live draws do not wait
+        // behind background early prewarming; general workers yield slightly.
+        if !role.urgent_only {
+            // SAFETY: a plain call on our own thread.
+            unsafe {
+                use windows::Win32::System::Threading::*;
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
         }
         let Some(work) = WORK[usize::from(role.screen)].get() else { return };
         loop {
@@ -434,7 +439,13 @@ fn worker(i: usize, role: Role) -> bool {
             if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                 drained();
             } else if !role.urgent_only {
-                super::library::save(false);
+                let urgent_waiting = work
+                    .queue
+                    .try_lock()
+                    .is_ok_and(|q| !q.urgent_graphics.is_empty() || !q.urgent_compute.is_empty());
+                if !urgent_waiting {
+                    super::library::save_periodic();
+                }
             }
         }
     });

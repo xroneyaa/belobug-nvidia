@@ -289,8 +289,10 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if !self.not_watched.load(Ordering::Relaxed) {
-            if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
-                if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            if let Some((now, written)) =
+                crate::watch::writes_since(start, start + size, false, last.asked)
+            {
+                if last.asked != 0 && written.is_empty() {
                     return (0, false);
                 }
                 last.asked = now;
@@ -547,6 +549,76 @@ fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
     });
 }
 
+/// Batched working-set + safe-read commitment probe over every 64 KiB block
+/// and final byte of `[start, end)`, avoiding SEH exceptions on resident pages.
+fn committed_blocks(start: usize, end: usize) -> bool {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const KERNEL_PAGE: usize = 4096;
+    if start >= end {
+        return true;
+    }
+    let mut addrs = [0usize; 256];
+    // SAFETY: plain POD array filled by `K32QueryWorkingSetEx`.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    let flush = |count: usize, addrs: &[usize; 256], info: &mut [PSAPI_WORKING_SET_EX_INFORMATION; 256]| -> bool {
+        if count == 0 {
+            return true;
+        }
+        for i in 0..count {
+            info[i].VirtualAddress = (addrs[i] & !(KERNEL_PAGE - 1)) as *mut _;
+        }
+        // SAFETY: `count` initialized entries matching `info` size in our own process.
+        let ok = unsafe {
+            K32QueryWorkingSetEx(
+                GetCurrentProcess(),
+                info.as_mut_ptr().cast(),
+                (count * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+            )
+        } != 0;
+        let mut byte = [0u8; 1];
+        for i in 0..count {
+            // SAFETY: kernel wrote valid flags when `ok` is true.
+            if ok && (unsafe { info[i].VirtualAttributes.Flags } & 1) != 0 {
+                continue;
+            }
+            if !crate::host::read_into(addrs[i] as *const u8, &mut byte) {
+                return false;
+            }
+        }
+        true
+    };
+    let mut count = 0usize;
+    let mut p = start;
+    while p < end {
+        addrs[count] = p;
+        count += 1;
+        if count == addrs.len() {
+            if !flush(count, &addrs, &mut info) {
+                return false;
+            }
+            count = 0;
+        }
+        p = (p + 1).next_multiple_of(1 << 16);
+    }
+    if end > start {
+        let tail = end - 1;
+        if count == 0 || addrs[count - 1] != tail {
+            if count == addrs.len() {
+                if !flush(count, &addrs, &mut info) {
+                    return false;
+                }
+                count = 0;
+            }
+            addrs[count] = tail;
+            count += 1;
+        }
+    }
+    flush(count, &addrs, &mut info)
+}
+
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
@@ -557,17 +629,7 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
         return true;
     }
     if !cfg!(test) {
-        // A byte of each 64 KiB read: querying a page of a big region costs
-        // as much as its pages are many.
-        let mut byte = [0u8; 1];
-        while p < end {
-            if !crate::host::read_into(p as *const u8, &mut byte) {
-                return false;
-            }
-            p = (p + 1).next_multiple_of(1 << 16);
-        }
-        return end <= at as usize
-            || crate::host::read_into((end - 1) as *const u8, &mut byte);
+        return committed_blocks(p, end);
     }
     while p < end {
         // SAFETY: plain data filled in by the query.
@@ -1126,5 +1188,41 @@ mod read_tests {
         });
         // SAFETY: this reservation is no longer used.
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn committed_blocks_detects_middle_holes_and_resident_spans() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        const BLOCK: usize = 64 << 10;
+        const SIZE: usize = 3 * BLOCK;
+        // SAFETY: isolated reservation released before returning.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert_ne!(base, 0);
+        // Only outer blocks committed, leaving block 1 uncommitted.
+        // SAFETY: inside reservation `base`.
+        assert_eq!(unsafe { VirtualAlloc(base as *mut _, BLOCK, MEM_COMMIT, PAGE_READWRITE) } as usize, base);
+        // SAFETY: inside reservation `base`.
+        assert_eq!(
+            unsafe { VirtualAlloc((base + 2 * BLOCK) as *mut _, BLOCK, MEM_COMMIT, PAGE_READWRITE) } as usize,
+            base + 2 * BLOCK
+        );
+        assert!(!super::committed_blocks(base, base + SIZE));
+
+        // Commit middle block and touch all three blocks so working set + read fallback both pass.
+        // SAFETY: inside reservation `base`.
+        assert_eq!(
+            unsafe { VirtualAlloc((base + BLOCK) as *mut _, BLOCK, MEM_COMMIT, PAGE_READWRITE) } as usize,
+            base + BLOCK
+        );
+        for k in 0..3 {
+            // SAFETY: committed read-write memory.
+            unsafe { ((base + k * BLOCK) as *mut u8).write_volatile(0x55) };
+        }
+        assert!(super::committed_blocks(base, base + SIZE));
+        // SAFETY: owned reservation.
+        assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);
     }
 }
