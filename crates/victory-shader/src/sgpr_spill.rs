@@ -313,7 +313,7 @@ mod tests {
 
     fn build(words: &[u32], wave64: bool) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        ir::build(&code, wave64, 8).unwrap()
+        ir::build_without_unspill(&code, wave64, 8).unwrap()
     }
 
     /// Translates a Wave64 compute program, with or without forwarding
@@ -331,7 +331,7 @@ mod tests {
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
-        let mut p = ir::build(&native.patched_code(), true, native.vgprs)?;
+        let mut p = ir::build_without_unspill(&native.patched_code(), true, native.vgprs)?;
         if fwd {
             forward(&mut p);
         }

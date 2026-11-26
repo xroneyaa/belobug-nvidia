@@ -714,3 +714,44 @@ fn wave64_early_out_followed_by_cross_half_lane_read_runs_on_wave32() {
         );
     }
 }
+
+#[test]
+fn one_wave_scalar_branch_from_valu_allows_lds_on_wave32() {
+    let body = [
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE89_106A, // s_bcnt1_i32_b64 s9, vcc
+        0xBF06_8009, // s_cmp_eq_u32 s9, 0
+        0xBF84_0001, // s_cbranch_scc0 +1
+        0xBF81_0000, // s_endpgm
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0x4A0A_00FF,
+        100,         // v_add_nc_u32 v5, 100, v0
+        0xD834_0000,
+        0x0000_0504, // ds_write_b32 v4, v5
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3A08_00A0, // v_xor_b32 v4, 32, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xD8D8_0000,
+        0x0200_0004, // ds_read_b32 v2, v4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ];
+    let mut native = program(&body, 64);
+    if let StageIo::Cs(ref mut cs) = native.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    let want: Vec<u32> = (0..8 * 64).map(|t| ((t % 64) ^ 32) + 100).collect();
+    for name in names {
+        let host = Host::on(&name).unwrap();
+        let target = host.target();
+        let cs = emit_for(&native, target).expect("one_wave VALU-derived scalar branch + LDS translates");
+        if !target.runs(64) {
+            assert_eq!(wave_size(&cs.dxil), Some(32));
+        }
+        let got = run(&host, &native, 8).expect("one_wave VALU scalar branch + LDS runs");
+        assert_eq!(got, want, "{name}: one_wave VALU scalar branch + LDS");
+    }
+}

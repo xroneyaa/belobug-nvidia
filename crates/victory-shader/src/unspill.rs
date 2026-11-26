@@ -24,13 +24,11 @@ use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{Program, Reg, Value};
 use crate::native::{HwStage, RootParam};
 
-/// Rewrites scalar loads from the user-data spill table into reads of the
-/// user SGPRs the root layout names. Leaves the program unchanged where
-/// anything does not fit (other programs, unexpected loads): those fail
-/// later with the reason they always did.
-pub fn unspill(p: &mut Program, layout: &[RootParam], stage: HwStage) {
+type UnspillPlan = (HashMap<Reg, Value>, HashMap<Value, Value>, Vec<(usize, usize)>);
+
+fn analyze(p: &Program, layout: &[RootParam], stage: HwStage) -> Option<UnspillPlan> {
     if layout.is_empty() {
-        return;
+        return None;
     }
     let covered = |code: u8| {
         layout.iter().any(|r| {
@@ -192,9 +190,23 @@ pub fn unspill(p: &mut Program, layout: &[RootParam], stage: HwStage) {
             remove.push((b, i));
         }
     }
-    if remove.is_empty() {
+    (!remove.is_empty()).then_some((new_inputs, replace, remove))
+}
+
+/// Whether `p` loads root parameters from a user-data spill table (used to keep
+/// un-unspilled BVH builder stages disabled when `VICTORY_RAYS` is off).
+pub fn would_unspill(p: &Program, layout: &[RootParam], stage: HwStage) -> bool {
+    analyze(p, layout, stage).is_some()
+}
+
+/// Rewrites scalar loads from the user-data spill table into reads of the
+/// user SGPRs the root layout names. Leaves the program unchanged where
+/// anything does not fit (other programs, unexpected loads): those fail
+/// later with the reason they always did.
+pub fn unspill(p: &mut Program, layout: &[RootParam], stage: HwStage) {
+    let Some((new_inputs, replace, remove)) = analyze(p, layout, stage) else {
         return;
-    }
+    };
     for block in &mut p.blocks {
         for phi in &mut block.phis {
             for a in &mut phi.args {
@@ -344,5 +356,12 @@ mod tests {
         let before = p.clone();
         unspill(&mut p, &layout, HwStage::Cs);
         assert_eq!(p, before);
+        assert!(!super::would_unspill(&p, &layout, HwStage::Cs));
+
+        // Spilled user-data loads are detected by would_unspill even when unspill is skipped.
+        let mut spilled = POINTER.to_vec();
+        spilled.extend([0xF404_0201, 0xFA00_0008, S_ENDPGM]);
+        let spilled_p = program(&spilled);
+        assert!(super::would_unspill(&spilled_p, &layout, HwStage::Cs));
     }
 }

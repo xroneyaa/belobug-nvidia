@@ -852,3 +852,34 @@ mod tests {
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
     }
 }
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_shader_heap(count: u32) -> (This, u64) {
+    #[repr(C)]
+    struct WithPlacement {
+        desc: HeapDesc,
+        placement: Placement,
+    }
+    let desc = WithPlacement {
+        desc: HeapDesc {
+            kind: 0,
+            count,
+            flags: 1,
+            nodes: 0,
+        },
+        placement: Placement { address: 0, size: 0 },
+    };
+    let iid = guid(
+        0x8efb471d,
+        0x616c,
+        0x4f49,
+        [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+    );
+    let mut h = std::ptr::null();
+    assert_eq!(
+        create_heap(std::ptr::null(), &desc.desc, &iid, &mut h),
+        crate::object::S_OK
+    );
+    let base = crate::object::slot::<extern "system" fn(This) -> u64>(h, 0x48)(h);
+    (h, base)
+}

@@ -355,47 +355,35 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    // Fast path: if we already guard or recorded a hole at `first`, we already
-    // know this is a mapped view and can skip `QueryVirtualMemoryInformation`.
-    {
-        let mut g = guards();
-        if g.protected.contains(&first) || g.holes.contains(&first) {
-            let mut written = Vec::new();
-            let mut run: Option<usize> = None;
-            for block in first..=last {
-                let open = block < last && !g.clean.contains(&block) && !g.holes.contains(&block);
-                if open {
-                    if g.protected.contains(&block) {
-                        g.clean.insert(block);
-                        written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-                    } else {
-                        run.get_or_insert(block);
-                        continue;
-                    }
-                }
-                if let Some(from) = run.take() {
-                    protect(&mut g, from, block, &mut written);
-                }
-            }
-            return Some(written);
+    let (mut g, check_each) = {
+        let g = guards();
+        if g.protected.contains(&first) {
+            (g, false)
+        } else if g.holes.contains(&first) {
+            (g, true)
+        } else {
+            drop(g);
+            // Slow path (first encounter): `start` is itself a mapped view, or if
+            // `start` is an unmapped hole (common in 2 GiB sparse shadows), jump past
+            // leading holes via `VirtualQuery` to find the first committed page.
+            let probe = if mapped(start) {
+                start
+            } else {
+                first_mapped(start, end)?
+            };
+            let check_each = probe != start;
+            install();
+            (guards(), check_each)
         }
-    }
-    // Slow path (first encounter): `start` is itself a mapped view, or if
-    // `start` is an unmapped hole (common in 2 GiB sparse shadows), jump past
-    // leading holes via `VirtualQuery` to find the first committed page.
-    let probe = if mapped(start) {
-        start
-    } else {
-        first_mapped(start, end)?
     };
-    let check_each = probe != start;
-    install();
-    let mut g = guards();
+    let mut written = Vec::new();
+    if first < last && g.clean.range(first..last).count() == last - first {
+        return Some(written);
+    }
     if !g.pins.is_empty() {
         let now = std::time::Instant::now();
         g.pins.retain(|&(_, _, until)| until > now);
     }
-    let mut written = Vec::new();
     let mut run: Option<usize> = None;
     for block in first..=last {
         let open = block < last
@@ -673,11 +661,28 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         return;
     }
     let end = at.saturating_add(len);
+    let (r0, r1) = (at / BLOCK, end.div_ceil(BLOCK));
     {
         let mut g = guards();
+        if !g.pins.is_empty() {
+            let mut kept = Vec::with_capacity(g.pins.len());
+            for (p0, p1, until) in g.pins.drain(..) {
+                if p1 <= r0 || p0 >= r1 {
+                    kept.push((p0, p1, until));
+                } else {
+                    if p0 < r0 {
+                        kept.push((p0, r0, until));
+                    }
+                    if r1 < p1 {
+                        kept.push((r1, p1, until));
+                    }
+                }
+            }
+            g.pins = kept;
+        }
         let blocks: Vec<usize> = g
             .protected
-            .range(at / BLOCK..end.div_ceil(BLOCK))
+            .range(r0..r1)
             .copied()
             .collect();
         let holes: Vec<usize> = g
@@ -715,6 +720,14 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         }
         if changed {
             bump_region_epochs(at, end);
+        }
+    }
+    {
+        let (first, last) = (at / PAGE, end.div_ceil(PAGE));
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<usize> = j.written.range(first..last).map(|(&p, _)| p).collect();
+        for page in keys {
+            j.written.remove(&page);
         }
     }
     crate::shadow::remapped(at as u64, end as u64);
@@ -1055,6 +1068,52 @@ mod tests {
         // SAFETY: the bytes just read.
         assert_eq!(unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) }, b"from the disk");
         assert_eq!(guard(view, view + 2 * BLOCK), Some((view / PAGE..view / PAGE + 1).collect()));
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    #[test]
+    fn fast_path_respects_active_pins() {
+        use std::io::{Read, Seek, Write};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: pagefile section of two blocks, mapped read-write and freed at the end.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        // Protect both blocks so `first` (block 0) enters the fast path later.
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        // Clean check skips quickly while both blocks remain clean.
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(Vec::new()));
+
+        // Pin only the second block; `first` stays protected so the next `guard`
+        // call hits the fast path.
+        writing(view + BLOCK + 100, 13);
+        let expected: Vec<usize> = ((view + BLOCK) / PAGE..(view + 2 * BLOCK) / PAGE).collect();
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(expected.clone()));
+        // While pinned, block 1 remains reported written and stays writable to the kernel.
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(expected));
+
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"pinned block!").unwrap();
+        file.rewind().unwrap();
+        // SAFETY: 13 bytes inside our mapped view block 1.
+        let into = unsafe { std::slice::from_raw_parts_mut((view + BLOCK + 100) as *mut u8, 13) };
+        assert_eq!(file.read(into).ok(), Some(13));
+        assert_eq!(into, b"pinned block!");
+
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);

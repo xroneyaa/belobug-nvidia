@@ -1,161 +1,145 @@
-# VIctory fork for AMD Radeon (work in progress)
+# VIctory fork for NVIDIA (RTX 3060 Ti / Wave32) & AMD (work in progress)
 
-This is a fork of [VIctory](https://github.com/Marvisak/VIctory) by Marvisak
-and its contributors. It follows upstream `main` up to `8e79c80` (2026-11-24),
-carries a number of upstream pull requests, and adds fixes found while running
-the game's world on one AMD card.
+This fork of [VIctory](https://github.com/Marvisak/VIctory) builds on
+upstream `main` (through `8e79c80`, 2026-11-24) and
+[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD),
+adding Wave32 / NVIDIA D3D12 support, pipeline scheduling fixes, texture budget
+management, and host/title memory synchronization fixes.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
-## State of this fork (2026-11-25)
+## State of this fork (2026-11-26)
 
-**Not playable yet: 3 to 5 frames per second.** Tested on one machine only:
-Windows 11, AMD Radeon RX 9070 XT 16 GB, Ryzen 7 9800X3D, 64 GB RAM, Series X
-profile. Nothing here has been run on an NVIDIA or Intel card.
+Development and offline shader/D3D12/workspace checks in this fork target
+**Windows 11**, **NVIDIA GeForce RTX 3060 Ti (8 GB VRAM, SM 6.6, Wave32
+`32-32`)**, while keeping the prior `Belobug` AMD RX 9070 XT (16 GB) base
+intact.
 
-| What | State on that machine |
-|------|-----------------------|
-| Boot, menus | work, 30 fps (as upstream) |
-| The world | renders lit, with textures, people, vehicles, vegetation, water and sky |
-| Saves | load and store |
-| Frame rate in the world | 3 to 5 fps (4.4 to 4.9 standing still in a heavy scene, about 3 while driving) |
-| Light in shadow | a constant, less of it in creases and under objects: the game's ray-traced indirect light does not run. One level does not suit every hour (see the known problems) |
-| Shadows of the sun and of lamps | the game's own, and they work; too much of the constant light drowns them |
-| Distant trees | drawn |
-| Vehicles in motion | whole (they lost and stretched parts until the copies of title memory saw writes through every view of a page) |
-| In-game phone | **broken**: with the phone out the world is unlit (black) and the phone is an empty outline |
-| Memory | about 22 GB of RAM and more video memory than a 16 GB card has |
+| Area | Current state |
+|------|---------------|
+| Target adapters | NVIDIA RTX 3060 Ti 8 GB (Wave32 `32-32`, capped descriptor heap fallback); prior base also ran on AMD RX 9070 XT 16 GB (Wave64) |
+| Shader translation (`shaders.rpf` -> Wave32 `32-32`) | **25,491 / 25,889** programs emit DXIL across 26,503 containers (614 duplicates skipped; 398 unsupported, see below) |
+| Live in-game status (RTX 3060 Ti, pre-batch baseline) | Before this batch of fixes, menus dropped from `70+ fps` to `~2 fps` and in-world cutscenes showed sky/UI over black unlit geometry (`~1 fps`, `1467–2511 draws/frame`) |
+| Live in-game status (after 2026-11-26 fixes) | **Not yet re-run in `game_scarlett_master.exe` here** — verified so far by workspace builds, unit tests, D3D12 pipeline/copy tests, and offline full-archive `shaders.rpf` translation |
+| Ray tracing (`VICTORY_RAYS`) | Disabled by default; BVH builder/wind compute passes stay skipped unless opted in |
 
-A driver timeout (Windows resets the display driver, every monitor goes black
-for a moment) happened once in the session this was written in. Expect it.
+### What this fork changes
 
-### What this fork changes over upstream
+#### NVIDIA & Wave32 hardware compatibility (`victory-shader`, `victory-gpu`)
+- **Wave64-on-Wave32 lowering (`crates/victory-shader/src/emit/lower.rs`)**:
+  scalars derived from VALU/VGPR sources remain CTA-uniform on single-wave
+  Wave32 dispatches (`group <= 64`), letting LDS barriers and stores lower
+  without spurious Wave64 retry failures.
+- **Scalarized light-loop `OwnBits` analysis (`crates/victory-shader/src/emit/own_bits.rs`)**:
+  proves when a `WaveActiveBitOr` only drives a loop over each lane's own
+  set bits and allows a 32-lane wave OR to stand in for 64 lanes
+  (`VICTORY_WAVE_OWN_BITS=0` disables this).
+- **Pre-SSA user-data unspilling & structured lane masks (`ir.rs`, `unspill.rs`, `sgpr_spill.rs`, `structure.rs`)**:
+  user-data spill-table loads are unspilled in production builds on both
+  Wave32 and Wave64, `would_unspill` gates un-unspilled BVH stages when
+  `VICTORY_RAYS` is off, and `structure.rs` tracks incoming edge masks for phi
+  joins (`phi_masks`).
+- **Capped descriptor heap handling (`victory-gpu`, commits `9941b5e`, `0390c9e`)**:
+  probes padded view heaps at startup and clamps view indices to the null slot
+  on capped heaps (`2^18` dynamic slots), instead of failing shader translation
+  or faulting out-of-bounds descriptors.
 
-Picture:
-- The world's indirect diffuse light is replaced by a constant while the ray
-  passes do not run. What the game's resolve pass left instead was bright
-  magenta on leaves, cloth and paper, and blocks of colours indoors
-  (`VICTORY_AMBIENT=<level>`, 0.6 by default; `off` keeps the game's output).
-  Its colour can be set (`VICTORY_AMBIENT_TINT=r,g,b`), and less of it
-  reaches creases, corners and the underside of things, worked out from the
-  scene's depth alone (`VICTORY_AMBIENT_SHADE=strength,radius`; grainy, it is
-  not blurred yet). In diagnostics builds all of it can be tuned in a running
-  game from a file (`VICTORY_AMBIENT_FILE`).
-- Blending is off on integer render targets in host pipelines: the console
-  ignores it there, D3D12 refuses the pipeline. One world pipeline the driver
-  refused at every launch is made now (pull request #45, pgm1207 and Arvi23).
-- In pixel shaders every read of another pixel of the same 2x2 quad goes
-  through quad reads, helper pixels included. Wave reads return 0 from helper
-  pixels on AMD, which showed as lines along every triangle on car paint,
-  glass and skin. Upstream does this after discards only.
-- A helper pixel's `v_readfirstlane` reads its own value (upstream `0601955`).
-- Twice the dynamic descriptor slots, so the tables of heavy frames fit.
-- Depth and stencil twins for depth textures written by compute, screen
-  passes with pipeline workers of their own, textures told apart by the mips
-  their memory really holds, and other fixes listed in the history.
+#### Pipeline queue, descriptor sync & VRAM/commit fixes (`victory-gpu`)
+- **Graphics-first pipeline scheduling (`crates/victory-gpu/src/pipeline/make.rs`)**:
+  splits urgent pipeline compilation into `urgent_graphics` (`graphics.is_some()`,
+  preempting compute) and `urgent_compute`; marks pipelines used
+  (`library::note_used`) before `enqueue`/`wait` so unbuilt urgent PSOs are not
+  evicted prematurely; keeps background 20 s cache saves (`library::save(false)`)
+  running even under urgent queue load; bounds frame waits via
+  `VICTORY_PIPELINE_WAIT_MS` (default `500` ms) and `VICTORY_PIPELINE_WAIT_SHARED`
+  (`0` disables shared per-kind budget).
+- **`R9G9B9E5_SHAREDEXP` copy-bridge & descriptor sync (`descriptor/host.rs`, `draw.rs`, `host.rs`)**:
+  uses a D3D12 buffer-bridge copy fallback for `R9G9B9E5_SHAREDEXP` (DXGI
+  format `42`) via shared `HostHeap::placed_raw_texture` across both bindless
+  (`resolve_placed`) and root-table (`use_slot`) descriptor paths, and flushes
+  dirty shared-exponent copies at the end of `HostContext::bind` so both
+  bindless and `Root::Table` draws see updated textures.
+- **8 GB placed texture budget & lazy host textures (`resource.rs`, `texture.rs`, `059b5fd`)**:
+  tracks active cached placed textures in `PLACED_CACHE_BYTES` and evicts idle
+  placed textures by `HostTexture::used` (`evict_idle_placed_to`) before
+  rejecting `texture_at` over budget, while keeping deferred retirement
+  (`PLACED_BYTES`) intact.
+- **Coalesced copy-back & sparse alignment guard (`host.rs`, `shadow.rs`, `61e1e4b`)**:
+  groups `finish_submission` copy-backs by `Shadow` and merges overlapping or
+  adjacent ranges (`merge_back_ranges`, `copy_back_many`, `sparse_back_many`),
+  and adds an early `gcd_u64` impossible-alignment check in `sparse_on_element`
+  without reintroducing blocking `memory_pressure()`/`sweep_now()` calls.
+- **Multi-view write-watch coherence (`watch.rs`)**:
+  unifies `guard` fast and slow paths (preserving active `pins`,
+  `bump_region_epochs`, clean-range skips, and `holes` checks) and clears
+  overlapping `pins` and stale `JOURNAL.written` timestamps in
+  `title_memory_remapped`.
 
-Speed:
-- The clamps of a run of indirect draws are recorded in a list before the
-  list that draws, and run one after another (`VICTORY_HOIST_CLAMPS`, 7 by
-  default, 0 for each before its draw): 225 to about 80 ms of GPU time per
-  frame in a scene of 9,000 draws.
-- The snapshots and the copy-back of the tiles shaders write are taken on
-  several threads (pull request #18, PikPakPik): copying back went from
-  about 43 to about 33 ms a frame here. The frame rate did not move.
-- The title's submissions can return before the host GPU is done, with what
-  they owe finished at the next wait (`VICTORY_ASYNC_SUBMIT=1`, off by
-  default): stable here, and no faster, because the frame is bound by the
-  processor's work, not by the wait.
-- Shader cache entries of another build can be reused
-  (`VICTORY_SHADER_BUILD_OF=<executable>`, diagnostics).
+#### Upstream `Belobug` & inherited features retained
+- Fallback ambient lighting (`VICTORY_AMBIENT`, `VICTORY_AMBIENT_TINT`,
+  `VICTORY_AMBIENT_SHADE`, `VICTORY_AMBIENT_FILE`), integer render-target blend
+  disable (PR #45), quad reads for helper pixels and `v_readfirstlane` fixes,
+  multi-threaded sparse copy-backs (PR #18), `VICTORY_HOIST_CLAMPS`,
+  optional `VICTORY_ASYNC_SUBMIT=1`, `VICTORY_SHADER_BUILD_OF`, and diagnostics
+  switches (`VICTORY_SHADER_PATCH`, `VICTORY_SHADER_SWAP`, `VICTORY_ALWAYS_COPY`,
+  `VICTORY_GPU_TIMING`).
+- Targeted `victory translate` diagnostics: `VICTORY_TRANSLATE_FOR` and
+  `VICTORY_TRANSLATE_ONLY=<hash,...>` in `apps/victory/src/translate.rs`.
 
-Memory the title shows at several addresses:
-- Every view of a guarded physical page is guarded with it, so a write of
-  the title's through another address is seen (the idea of victory-fork
-  #115 and victory-amd, written anew here); blocks the kernel is about to
-  write stay writable for two seconds. Before this, parts of moving
-  vehicles were left behind; the distant trees' quads that crossed the
-  screen have not come back since either (cause not proven).
+### Verified builds & tests (2026-11-26)
 
-AMD:
-- Shaders that crash or never leave the AMD driver's compiler cost only
-  their pipeline, not the run.
-- Buffer element counts come from the host's own table, not a size query the
-  driver's compiler crashes on.
+All checks below ran with `--locked` on Windows 11 + RTX 3060 Ti (`host waves 32-32`):
 
-Diagnostics (diagnostics builds): `VICTORY_SHADER_PATCH` changes one word of a
-shader's machine code before translation, `VICTORY_SHADER_SWAP` replaces
-shader containers by files, `VICTORY_ALWAYS_COPY=1` refreshes every copy of
-title memory each frame, `VICTORY_GPU_TIMING=1` logs GPU time per pipeline.
-Each is described in a comment where it is read.
-
-### How it is run here
-
-A diagnostics build (`cargo build --profile diag -p victory --features
-diagnostics`), with:
-
-```
-VICTORY_PRESENT_TARGET=1x1:1
-VICTORY_HAIR=1
-victory run <game_scarlett_master.exe> --execute --console series-x
-```
-
-The first launch after a build translates every shader and builds about
-2,500 pipelines; the loading screen can stay frozen, with sound, for minutes.
+- `cargo check --workspace --all-targets --locked`: **passed**
+- `cargo build --release --locked` and `cargo build --profile diag -p victory --features diagnostics --locked`: **passed**
+- Passing suites (`0` failed): `victory-gpu` (`130 passed; 4 ignored`),
+  `victory` (`1 passed`), `victory-core` (`11 passed`), `victory-formats`
+  (`24 passed; 4 ignored`), `victory-game` (`2 passed`), `victory-pe`
+  (`7 passed`), `victory-pipeline` (`4 passed`), `victory-loader`
+  (`22 passed; 1 ignored` lib + `4 passed` across `crash_log`, `load_probe`,
+  and `title_dlls`).
+- `cargo-clippy.exe` is not installed on this toolchain.
 
 ### Known problems
 
-- With the in-game phone out the world is unlit (see the table).
-- The per-draw descriptor slots are few for the heaviest places: when they
-  run out, some draws of a frame are dropped.
-- Memory: the process commits about 33 GB after a quarter of an hour's
-  drive (the title's own 7 GB, 8 GB of textures on the card, copies of its
-  buffers, and the system's backing of video memory).
-- No ray-traced light; the constant that stands in for it is the same
-  everywhere and at every hour. The default of 0.6 is too much at night (it
-  fills the shadows the game's lamps cast and the picture goes flat) and too
-  little at noon (what the sun does not reach is nearly black). Levels that
-  looked right on this machine: 0.07 bluish at night, 0.3 warm at dusk and
-  dawn, 1.4 sky blue at noon. Making it follow the game's sky is being
-  worked on.
-- Some compute programs do not translate (ray-tracing structure builders,
-  wind volumes, a few others) and their passes are dropped. With
-  `VICTORY_RAYS=1` the builders translate and run, and the GPU stops
-  answering about 25 seconds later (device removed): do not expect light
-  from it.
-- About 380 draws of a frame are dropped in the world for want of a host
-  pipeline: programs that do not translate, and six pipelines the AMD driver
-  refuses (two compute, four mesh). Which of the two costs most is not
-  measured.
-- Windows 10 is reported not to get past start-up without a newer D3D12
-  runtime (issue #9, pull request #44, not merged or tried here yet); this
-  fork has only been run on Windows 11.
-- One test fails on this machine, before and after this update:
-  `list::tests::lists_are_cut_at_waits_that_follow_work`.
-- `crates/victory-shader/src/emit/lower.rs` is larger than the size limit of
-  `cargo xtask policy`; it is source code, not an asset.
-- Many changes are specific to this title and this GPU, and some are marked
-  `shortcut:` in the code where they approximate what the console does.
+- **Unverified in-game visually after 2026-11-26 edits**: live playback of
+  `game_scarlett_master.exe` has not yet been re-tested after the shader,
+  pipeline-queue, `use_slot` `R9G9B9E5` sync, and placed-texture budget fixes.
+- **Wave32 unsupported console shaders**: across `shaders.rpf`, `398` of `25,889`
+  programs still fail to translate (`195` non-VS/PS/CS/MS stages, `71` mesh
+  shaders exceeding 32 KiB, `14` console wave64 lane ops, `8` LDS without
+  barriers, and `opaque lane mask` / `conditional export` cases).
+- **Pre-existing failing tests (4 + 5 + 1)**:
+  - `victory-shader` (`279 passed; 4 failed; 6 ignored`): 4 pre-existing Wave32
+    `emit::valu_tests` failures (`loop_exit_mask_counted_after_the_loop`,
+    `mask_grown_inside_a_branch_counted_after_it`,
+    `scalar_counted_in_a_divergent_loop_read_after_it`,
+    `scalar_counted_in_nested_divergent_loops`).
+  - `victory-hle` (`97 passed; 5 failed; 1 ignored`): 5 pre-existing
+    `modules::xmem::tests` failures (`a_run_keeps_the_placeholders_it_spans`,
+    `a_run_maps_across_two_placeholders`,
+    `a_run_maps_again_after_a_partial_unmap`, `mapping_no_pages_changes_nothing`,
+    `physical_pages_map_alias_and_unmap`).
+  - `xtask` (`3 passed; 1 failed`): `policy::tests::repository_passes_policy`
+    reports `crates/victory-shader/src/emit/lower.rs` (`677,419` bytes >
+    `524,288`-byte asset-policy limit); it is Rust source, not a game asset.
+- **Ray-traced indirect light (`VICTORY_RAYS=1`)**: un-unspilled BVH/ray
+  compute stages remain skipped by default (`VICTORY_AMBIENT` supplies fallback
+  indirect diffuse lighting).
+- **Windows 10 / non-DX12 SM 6.6 hosts**: untested here (see upstream #9 / #44).
 
 ### Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors is the base of everything here. Licensed GPL-3.0-or-later; so
-  is this fork. Upstream's history and the authors of the pull requests
-  carried here are kept in the commit history.
-- Pull requests merged into this fork, read line by line and run in the
-  world before merging: #45 (pgm1207, sent by Arvi23) and #18 (PikPakPik).
-  The others are still to be read; thank you for them and for the test
-  reports.
-- [fxceless/victory-fork](https://github.com/fxceless/victory-fork) and
-  [myokex/victory-amd](https://github.com/myokex/victory-amd) were read for
-  comparison; no code of theirs is in this fork.
-- [XCL](https://github.com/ivall/xcl) by ivall: its README was read; no code
-  of it is here.
-- This fork's changes were developed with
-  [Claude Code](https://claude.com/claude-code) and Gemini (Antigravity).
+  contributors (GPL-3.0-or-later).
+- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**
+  and merged upstream PRs **#45** (pgm1207 / Arvi23) and **#18** (PikPakPik).
+- [fxceless/victory-fork](https://github.com/fxceless/victory-fork),
+  [myokex/victory-amd](https://github.com/myokex/victory-amd), and
+  [ivall/xcl](https://github.com/ivall/xcl) were consulted for design comparison
+  by upstream/fork authors.
 
 ---
 

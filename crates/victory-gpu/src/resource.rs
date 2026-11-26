@@ -844,6 +844,8 @@ struct Resource {
 
 #[cfg(windows)]
 static PLACED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static PLACED_CACHE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(windows)]
 fn default_placed_budget_bytes(dedicated_vram_mb: u64) -> u64 {
@@ -876,7 +878,7 @@ fn placed_budget_allows() -> bool {
         return true;
     }
     let limit = placed_budget_bytes();
-    limit == 0 || PLACED_BYTES.load(std::sync::atomic::Ordering::Relaxed) < limit
+    limit == 0 || PLACED_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed) < limit
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -897,6 +899,8 @@ pub(crate) struct HostTexture {
     pub(crate) skip: u32,
     /// Whether it is a placed texture counted in [`PLACED_BYTES`].
     pub(crate) placed: bool,
+    /// Presented frame when this host texture was last used.
+    pub(crate) used: std::sync::atomic::AtomicU64,
     /// Whether it is an R32 render/UAV target whose R9G9B9E5 reads use a copy bridge.
     pub(crate) r32_target: bool,
     /// Set across submissions when this texture was written and needs a shared-exponent copy.
@@ -1262,6 +1266,7 @@ pub(crate) fn shared_exponent<'a>(this: This) -> Option<&'a SharedExponentCopy> 
                 slot: None,
                 skip: 0,
                 placed: false,
+                used: std::sync::atomic::AtomicU64::new(crate::queue::presented()),
                 r32_target: false,
                 shared_dirty: Default::default(),
                 written: Default::default(),
@@ -1409,6 +1414,7 @@ impl Resource {
                     slot,
                     skip,
                     placed: self.placed,
+                    used: std::sync::atomic::AtomicU64::new(crate::queue::presented()),
                     r32_target,
                     shared_dirty: Default::default(),
                     written: Default::default(),
@@ -1419,6 +1425,14 @@ impl Resource {
                 }))
             })
             .as_ref()
+    }
+}
+
+#[cfg(windows)]
+fn touch_used(host: &HostTexture) {
+    let now = crate::queue::presented();
+    if host.used.load(std::sync::atomic::Ordering::Relaxed) != now {
+        host.used.store(now, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1442,7 +1456,10 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).ensure_host().map(|h| &h.texture)
+    resource(this).ensure_host().map(|h| {
+        touch_used(h);
+        &h.texture
+    })
 }
 
 /// The twins of a depth texture the title also writes as an image (see
@@ -1466,7 +1483,10 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).ensure_host().cloned()
+    resource(this).ensure_host().map(|h| {
+        touch_used(h);
+        h.clone()
+    })
 }
 
 #[cfg(windows)]
@@ -2091,6 +2111,61 @@ pub(crate) fn placed_live() -> std::collections::HashSet<usize> {
     live
 }
 
+/// Evicts oldest idle placed textures (unused for at least two presented frames
+/// and not currently held by any live copy) until `PLACED_CACHE_BYTES` is at or
+/// below `target_bytes`, returning the number of evicted textures.
+#[cfg(windows)]
+fn evict_idle_placed_to(target_bytes: u64, now: u64) -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    const MIN_IDLE_FRAMES: u64 = 2;
+    if PLACED_CACHE_BYTES.load(Relaxed) <= target_bytes {
+        return 0;
+    }
+    let evicted: Vec<usize> = {
+        let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut candidates: Vec<(u64, (u64, [u32; 14]), usize, u64)> = map
+            .iter()
+            .filter_map(|(&key, &(res, _))| {
+                let host = resource(res as This).host_made()?;
+                if !host.placed || std::sync::Arc::strong_count(host) > 1 {
+                    return None;
+                }
+                let used = host.used.load(Relaxed);
+                (now.saturating_sub(used) >= MIN_IDLE_FRAMES)
+                    .then_some((used, key, res, host.bytes))
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|&(used, key, _, _)| (used, key.0));
+        let mut live = PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut current = PLACED_CACHE_BYTES.load(Relaxed);
+        let mut freed = 0u64;
+        let mut gone = Vec::new();
+        for (_, key, res, bytes) in candidates {
+            if current <= target_bytes {
+                break;
+            }
+            if map.remove(&key).is_some() {
+                live.remove(&res);
+                gone.push(res);
+                freed = freed.saturating_add(bytes);
+                current = current.saturating_sub(bytes);
+            }
+        }
+        crate::memstat::sub(&PLACED_CACHE_BYTES, freed);
+        crate::memstat::PLACED_COUNT.store(map.len() as u64, Relaxed);
+        gone
+    };
+    let count = evicted.len();
+    if count > 0 {
+        EVICTED.fetch_add(count as u64, Relaxed);
+        PLACED_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+        for res in evicted {
+            resource_release(res as This);
+        }
+    }
+    count
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
@@ -2115,11 +2190,18 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
     {
         let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&(r, _)) = map.get(&(address, *desc)) {
+            if let Some(host) = resource(r as This).host_made() {
+                touch_used(host);
+            }
             return Some(r as This);
         }
     }
     if !placed_budget_allows() {
-        return None;
+        let limit = placed_budget_bytes();
+        evict_idle_placed_to(limit.saturating_sub(limit / 8), crate::queue::presented());
+        if !placed_budget_allows() {
+            return None;
+        }
     }
     let size = match texture_layout(&d) {
         Some(t) if largest > 0 && t.planes.len() == 1 => t.planes[0].layout.reach(largest),
@@ -2153,6 +2235,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
         resource_release(out);
         return None;
     }
+    let bytes = resource(out).host_made().map_or(0, |h| h.bytes);
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&(r, _)) = map.get(&(address, *desc)) {
         drop(map);
@@ -2162,6 +2245,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
     PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner()).insert(out as usize);
     PLACED_LONGEST.fetch_max(end - address, std::sync::atomic::Ordering::AcqRel);
     map.insert((address, *desc), (out as usize, end));
+    PLACED_CACHE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     crate::memstat::PLACED_COUNT.store(map.len() as u64, std::sync::atomic::Ordering::Relaxed);
     Some(out)
 }
@@ -2260,12 +2344,21 @@ pub(crate) fn evict_placed_textures(start: u64, end: u64) {
             .map(|(k, _)| *k)
             .collect();
         let mut live = PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut freed = 0u64;
         for key in over {
             if let Some((res, _)) = map.remove(&key) {
                 live.remove(&res);
+                if let Some(host) = resource(res as This).host_made() {
+                    freed = freed.saturating_add(host.bytes);
+                }
                 evicted.push(res);
             }
         }
+        crate::memstat::sub(&PLACED_CACHE_BYTES, freed);
+        crate::memstat::PLACED_COUNT.store(
+            map.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     EVICTED.fetch_add(evicted.len() as u64, std::sync::atomic::Ordering::Relaxed);
     if !evicted.is_empty() {
@@ -2485,6 +2578,42 @@ pub(crate) fn test_buffer(width: u64) -> This {
         0,
         &desc,
         0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_texture_at(
+    address: u64,
+    width: u64,
+    height: u32,
+    format: u32,
+    layout: u32,
+    flags: u32,
+) -> This {
+    let desc = ResourceDesc {
+        dimension: 3, // TEXTURE2D
+        alignment: 0,
+        width,
+        height,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format,
+        sample_count: 1,
+        sample_quality: 0,
+        layout,
+        flags,
+    };
+    let mut out = std::ptr::null();
+    let hr = create_at_address(
+        std::ptr::null(),
+        address,
+        &desc,
+        u32::MAX,
         std::ptr::null(),
         &RESOURCE_IIDS[0],
         &mut out,
@@ -3384,5 +3513,46 @@ mod tests {
         assert_eq!(host.is_some(), has_host);
         assert_eq!(resource(tex).host_made().is_some(), has_host);
         assert_eq!(slot::<Release>(tex, 0x10)(tex), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn evict_idle_placed_to_reclaims_old_textures_and_keeps_recent() {
+        use std::sync::atomic::Ordering;
+        if crate::host::host().is_none() {
+            return;
+        }
+        let words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 0x0001_0001, 28, 1, 0, 0x100, 0, 0];
+        let mut old_buf = vec![0u8; 64 * 64 * 4];
+        let mut fresh_buf = vec![0u8; 64 * 64 * 4];
+        let old_addr = old_buf.as_mut_ptr() as u64;
+        let fresh_addr = fresh_buf.as_mut_ptr() as u64;
+
+        let base = super::PLACED_CACHE_BYTES.load(Ordering::Acquire);
+        let old_res = super::texture_at(old_addr, &words, 0).expect("old placed texture");
+        let fresh_res = super::texture_at(fresh_addr, &words, 0).expect("fresh placed texture");
+        let fresh_bytes = {
+            let h = super::host_copy(fresh_res).expect("fresh host");
+            h.bytes
+        };
+        resource(old_res)
+            .host_made()
+            .unwrap()
+            .used
+            .store(1, Ordering::Relaxed);
+        resource(fresh_res)
+            .host_made()
+            .unwrap()
+            .used
+            .store(10, Ordering::Relaxed);
+
+        let evicted = super::evict_idle_placed_to(base + fresh_bytes, 10);
+        assert!(evicted >= 1);
+        assert!(!super::has_placed_texture(old_addr, &words));
+        assert!(super::has_placed_texture(fresh_addr, &words));
+        assert!(super::PLACED_CACHE_BYTES.load(Ordering::Acquire) <= base + fresh_bytes);
+
+        super::evict_placed_textures(fresh_addr, fresh_addr + fresh_buf.len() as u64);
+        assert!(!super::has_placed_texture(fresh_addr, &words));
     }
 }

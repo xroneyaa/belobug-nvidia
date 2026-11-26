@@ -747,6 +747,7 @@ mod tests {
             slot: None,
             skip: 0,
             placed: false,
+            used: std::sync::atomic::AtomicU64::new(0),
             r32_target: false,
             shared_dirty: Default::default(),
             written: Default::default(),

@@ -138,6 +138,18 @@ const MAX_NODES: usize = 1 << 21;
 /// Cap the `ite` memo table so complex shaders cannot trigger multi-tens-of-MB
 /// HashMap resizes (e.g. 35 MB at 2^21 buckets) under concurrent compilation.
 const MAX_MEMO: usize = 1 << 18;
+/// Case splits [`Bools::meet`] makes before it gives up.
+const MAX_MEET: usize = 1 << 16;
+/// Conditions [`Meets`] keeps; past that, they are searched anew.
+const MAX_MEETS: usize = 1 << 18;
+
+/// What [`Bools::meet`] found out about one [`Bools`], for its later calls:
+/// the conditions no lane satisfies, and the case splits it took to find
+/// that out of each.
+#[derive(Debug, Default)]
+pub struct Meets {
+    none: Map<Box<[u32]>, usize>,
+}
 
 impl Bools {
     fn new() -> Self {
@@ -271,6 +283,88 @@ impl Bools {
         self.ite(a, nb, b)
     }
 
+    /// Whether some lane can satisfy every `(b, holds)` of `all` at once:
+    /// `b` where `holds`, its negation where not. Yes when the search grows
+    /// too large to finish.
+    pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
+        self.meet_seen(all, &mut Meets::default())
+    }
+
+    /// [`Self::meet`], which looks up in `seen` what earlier calls on these
+    /// `Bools` found out and adds what it finds. The answer is the one
+    /// `meet` gives.
+    pub fn meet_seen(&self, all: &[(Bool, bool)], seen: &mut Meets) -> bool {
+        self.meet_within(all, MAX_MEET, seen)
+    }
+
+    fn meet_within(&self, all: &[(Bool, bool)], mut budget: usize, seen: &mut Meets) -> bool {
+        let mut work = all
+            .iter()
+            .map(|&(b, holds)| b.0 << 1 | u32::from(holds))
+            .collect();
+        self.meet_in(0, &mut work, &mut budget, seen)
+    }
+
+    fn meet_in(
+        &self,
+        at: usize,
+        work: &mut Vec<u32>,
+        budget: &mut usize,
+        seen: &mut Meets,
+    ) -> bool {
+        let mut kept = at;
+        for i in at..work.len() {
+            let (b, holds) = (work[i] >> 1, work[i] & 1 != 0);
+            if b > Bool::TRUE.0 {
+                work[kept] = work[i];
+                kept += 1;
+            } else if (b == Bool::TRUE.0) != holds {
+                work.truncate(at);
+                return false;
+            }
+        }
+        work.truncate(kept);
+        if kept == at || *budget == 0 {
+            work.truncate(at);
+            return true;
+        }
+        work[at..].sort_unstable();
+        let mut end = at + 1;
+        for i in at + 1..kept {
+            if work[i] != work[end - 1] {
+                work[end] = work[i];
+                end += 1;
+            }
+        }
+        work.truncate(end);
+        if let Some(&splits) = seen.none.get(&work[at..]) {
+            let within = splits <= *budget;
+            *budget = budget.saturating_sub(splits);
+            work.truncate(at);
+            return !within;
+        }
+        let before = *budget;
+        *budget -= 1;
+        let top = |code: u32| self.nodes[(code >> 1) as usize].0;
+        let v = work[at..].iter().map(|&c| top(c)).min().expect("not empty");
+        let mut found = false;
+        for value in [false, true] {
+            for i in at..end {
+                let (lo, hi) = self.split(Bool(work[i] >> 1), v);
+                work.push((if value { hi } else { lo }).0 << 1 | work[i] & 1);
+            }
+            if self.meet_in(end, work, budget, seen) {
+                found = true;
+                break;
+            }
+        }
+        if !found && seen.none.len() < MAX_MEETS {
+            seen.none.insert(work[at..end].into(), before - *budget);
+        }
+        work.truncate(at);
+        found
+    }
+
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
         let nb = self.not(b);
         self.and(a, nb) == Bool::FALSE
@@ -377,6 +471,9 @@ pub struct Structured {
     /// enough (lanes outside EXEC then never get there, so a VGPR write
     /// needs no old value). Always `None` for scalar instructions.
     pub guards: Vec<Vec<Option<Bool>>>,
+    /// Per block: what holds in every lane that enters it (over forward
+    /// edges; a loop header forgets what its loop redefines).
+    pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
     /// Symbolic select conditions, keyed by the destination SSA value.
@@ -388,6 +485,9 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Incoming lane boolean per predecessor edge (in block predecessor order)
+    /// for each [`Atom::Phi`] id.
+    pub phi_masks: HashMap<Value, Vec<Bool>>,
     /// Per block and instruction: the lane's EXEC bit at each vector
     /// instruction, whatever path the lane took (`None` for scalar ones).
     /// What a program run as the console runs it, every lane through every
@@ -458,6 +558,8 @@ struct Lanes<'a> {
     scc_lane: Map<Value, Bool>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
+    /// Mask joins left as [`Atom::Phi`], to record their incoming edge masks.
+    phi_joins: Vec<PhiJoin>,
     /// Per block: what a lane knows on entry, over forward edges only.
     first: Vec<Bool>,
     /// Per block ending in a branch: when a lane takes it.
@@ -473,6 +575,12 @@ struct Join {
     /// The phi value naming the join.
     id: Value,
     value: bool,
+    args: Vec<Key>,
+}
+
+struct PhiJoin {
+    block: usize,
+    id: Value,
     args: Vec<Key>,
 }
 
@@ -526,6 +634,7 @@ impl<'a> Lanes<'a> {
             select_masks: HashMap::new(),
             scc_lane: Map::default(),
             joins: Vec::new(),
+            phi_joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
@@ -539,6 +648,7 @@ impl<'a> Lanes<'a> {
         self.select_masks.clear();
         self.scc_lane.clear();
         self.joins.clear();
+        self.phi_joins.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
@@ -640,6 +750,22 @@ impl<'a> Lanes<'a> {
         execs: &[Vec<Option<Bool>>],
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
+        let phi_joins = std::mem::take(&mut self.phi_joins);
+        let mut phi_masks = HashMap::with_capacity(phi_joins.len());
+        for pj in phi_joins {
+            let incoming: Vec<Bool> = pj
+                .args
+                .into_iter()
+                .enumerate()
+                .map(|(n, a)| {
+                    let (q, taken) = self.incoming[pj.block][n];
+                    let e = self.edge(cond[q], q, taken);
+                    let m = self.mask(a).0;
+                    self.b.given(m, e)
+                })
+                .collect();
+            phi_masks.insert(pj.id, incoming);
+        }
         let blocks = &self.p.blocks;
         let b = &mut self.b;
         let guards = blocks
@@ -688,9 +814,11 @@ impl<'a> Lanes<'a> {
                 .collect(),
             select_masks: self.select_masks,
             active: self.active,
+            phi_masks,
             bools: self.b,
             exits,
             guards,
+            reach: cond.to_vec(),
             execs: execs.to_vec(),
             others: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
         })
@@ -822,6 +950,7 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
+        self.phi_joins.push(PhiJoin { block, id, args });
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))
     }

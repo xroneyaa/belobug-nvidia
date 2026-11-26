@@ -93,6 +93,7 @@ mod lds_tests;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 mod lower;
+mod own_bits;
 mod rectangle;
 #[cfg(test)]
 mod opcode_audit;
@@ -306,6 +307,7 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
     if rays() {
         crate::unspill::unspill(&mut p, &native.layout, native.stage);
     }
+    let has_spill = crate::unspill::would_unspill(&p, &native.layout, native.stage);
     crate::sgpr_spill::forward(&mut p);
     let traces = resource::traces_rays(&p);
     let io = io::raise(&p, &native)?;
@@ -314,10 +316,11 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
         let res = resource::track_with(&p, &native.layout, native.stage, addresses)?;
         emit(&c, &native, &p, &st, &io, &res, target)
     };
-    let compute = native.stage == HwStage::Cs && rays();
-    let plain = match with(traces && compute) {
+    let compute = native.stage == HwStage::Cs && (rays() || !has_spill);
+    let allow_traces = native.stage == HwStage::Cs && rays();
+    let plain = match with(traces && allow_traces) {
         Err(ShaderError::Unsupported { .. }) if compute && !traces => with(true),
-        Err(ShaderError::Unsupported { .. }) if compute => with(false),
+        Err(ShaderError::Unsupported { .. }) if allow_traces => with(false),
         done => return done,
     };
     plain
@@ -1225,17 +1228,59 @@ mod tests {
         };
         let target = host.target();
         eprintln!("host waves {}-{}", target.lanes_min, target.lanes_max);
-        let words = [0xD760_0000, 0x0001_0B00, 0x7E02_0200, 0xBF81_0000];
+        // Compute kernel with live `v_readlane_b32` feeding `buffer_store_dword`
+        // so DCE keeps the lane-reading op and emission respects `WaveSize`.
+        let words = [
+            0xBE82_0300u32, // s_mov_b32 s2, s0
+            0xBE83_0380,    // s_mov_b32 s3, 0
+            0xF408_0101,
+            0xFA00_0000,    // s_load_dwordx4 s[4:7], s[2:3], null
+            0xBF8C_C07F,    // s_waitcnt lgkmcnt(0)
+            0xD760_0009,
+            0x0001_0B00,    // v_readlane_b32 s9, v0, 5
+            0x7E04_0209,    // v_mov_b32 v2, s9
+            0x3406_0082,    // v_lshlrev_b32 v3, 2, v0
+            0xE070_1000,
+            0x8001_0203,    // buffer_store_dword v2, v3, s[4:7], 0 offen
+            0xBF81_0000,    // s_endpgm
+        ];
+        let make = |wave64| {
+            let mut p = compute_of(&words, wave64, 128);
+            p.layout = vec![crate::RootParam {
+                root: crate::RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }];
+            if let crate::native::StageIo::Cs(ref mut cs) = p.io {
+                cs.rsrc2 = 1 << 1;
+            }
+            p
+        };
         for wave64 in [false, true] {
-            let cs = emit_for(&compute_of(&words, wave64, 128), target)
+            let cs = emit_for(&make(wave64), target)
                 .unwrap_or_else(|e| panic!("wave64 {wave64}: expected translation: {e}"));
             if let Err(e) = host.compute_pipeline(&cs) {
                 panic!("wave64 {wave64}: translated for the host, refused by it: {e}");
             }
             if wave64 && !target.runs(64) {
-                // Verify Target::ANY still emits Wave64 (which a Wave32 host refuses).
-                let any = emit_for(&compute_of(&words, true, 128), Target::ANY).unwrap();
-                assert!(host.compute_pipeline(&any).is_err());
+                let psv_wave = |dxil: &[u8]| -> Option<(u32, u32)> {
+                    let c = crate::Container::parse(dxil).ok()?;
+                    let psv = c.part(crate::FourCC::PSV0)?.data;
+                    Some((
+                        crate::dxbc::u32_at(psv, 4 + 16).ok()?,
+                        crate::dxbc::u32_at(psv, 4 + 20).ok()?,
+                    ))
+                };
+                assert_eq!(psv_wave(&cs.dxil), Some((32, 32)));
+                let any = emit_for(&make(true), Target::ANY).unwrap();
+                assert_eq!(psv_wave(&any.dxil), Some((64, 64)));
+                assert!(
+                    host.compute_pipeline(&any).is_err(),
+                    "Wave32 host unexpectedly accepted WaveSize(64) shader"
+                );
             }
         }
     }

@@ -350,6 +350,20 @@ fn translate(
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
     };
+    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        std::env::var("VICTORY_TRANSLATE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if !only.is_empty() && !only.iter().any(|o| hash.starts_with(o.as_str())) {
+        return;
+    }
+    let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
@@ -363,6 +377,24 @@ fn translate(
     };
     if !lock(seen).insert(blake3::hash(dxil)) {
         t.duplicates += 1;
+        return;
+    }
+    if std::env::var_os("VICTORY_TRANSLATE_FOR").is_some_and(|v| v != "0") {
+        t.programs += 1;
+        match emit::translate_for(&bytes, checks.target) {
+            Ok(shader) => {
+                t.emitted += 1;
+                t.lines.push(format!("OK {hash} {:?}", shader.stage));
+                if checks.validator.is_some() || checks.host.is_some() {
+                    let label = || format!("{} {hash}", example());
+                    check(shader, t, checks, label);
+                }
+            }
+            Err(e) => {
+                t.failed.entry(e.to_string()).or_insert((0, example())).0 += 1;
+                t.lines.push(format!("ERR {hash} {e}"));
+            }
+        }
         return;
     }
     let programs = match victory_shader::container_programs(&container) {

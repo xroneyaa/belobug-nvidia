@@ -1563,32 +1563,30 @@ impl Host {
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             }
         } else {
-            // Group by Shadow pointer so distinct shadows run in parallel
-            // across CPU cores without lock contention on `before`/`pending`.
-            let mut groups: Vec<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>> =
+            // Group by Shadow pointer so overlapping/duplicate ranges coalesce per
+            // copy and distinct shadows run in parallel across CPU cores.
+            let mut groups: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
                 Vec::new();
-            for item in back {
+            for (shadow, address, len) in back {
                 if let Some(g) = groups
                     .iter_mut()
-                    .find(|g| std::sync::Arc::ptr_eq(&g[0].0, &item.0))
+                    .find(|(s, _)| std::sync::Arc::ptr_eq(s, &shadow))
                 {
-                    g.push(item);
+                    g.1.push((address, len));
                 } else {
-                    groups.push(vec![item]);
+                    groups.push((shadow, vec![(address, len)]));
                 }
             }
             if groups.len() <= 1 {
-                for (shadow, address, len) in &groups[0] {
-                    let written = shadow.copy_back(*address, *len);
+                if let Some((shadow, ranges)) = groups.first() {
+                    let written = shadow.copy_back_many(ranges);
                     COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
                 }
             } else {
                 in_parallel(&groups, 8, |chunk| {
-                    for g in chunk {
-                        for (shadow, address, len) in g {
-                            let written = shadow.copy_back(*address, *len);
-                            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-                        }
+                    for (shadow, ranges) in chunk {
+                        let written = shadow.copy_back_many(ranges);
+                        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
                     }
                 });
             }
@@ -2085,6 +2083,9 @@ impl HostList {
     pub(crate) fn flush_dirty_shared_exponents(&self) {
         let ready: Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)> = {
             let mut dirty = self.r32_dirty.lock().unwrap_or_else(|e| e.into_inner());
+            if dirty.is_empty() {
+                return;
+            }
             let keys: Vec<usize> = dirty
                 .iter()
                 .filter(|(_, c)| c.shared_copy.get().and_then(Option::as_ref).is_some())

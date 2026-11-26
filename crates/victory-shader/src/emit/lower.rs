@@ -551,6 +551,8 @@ struct Lower<'a> {
     local_ok: bool,
     /// VGPR values guaranteed uniform across all active lanes at definition.
     uniform: HashSet<Value>,
+    /// Wave ORs that only steer a loop over each lane's own bits ([`super::own_bits`]).
+    own_bits: super::own_bits::OwnBits,
     /// 1-dword TGSM counter assigning aligned console wave bases in multi-D groups.
     wave_base_global: Option<V>,
     /// Group-shared table for cross-half `ds_bpermute_b32` (64 dwords per console wave).
@@ -753,7 +755,7 @@ fn mask_numbers(st: &Structured, p: &crate::ir::Program) -> HashSet<Value> {
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
+pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let ops: Vec<&Operand> = match &i.fields {
         // A mask operation (its result a mask) is no data use.
@@ -1012,6 +1014,11 @@ fn half_inputs(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, (bool, Option
     out
 }
 
+/// `VICTORY_WAVE_OWN_BITS=0` disables loop-only wave-OR handling ([`super::own_bits`]).
+fn own_bits_on() -> bool {
+    std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0")
+}
+
 /// Elements from multi-element 16-bit signature rows that overflow a 4-dword
 /// `pack2` attribute (because each element starts on a whole dword) and spill
 /// into free dwords of a subsequent `pack2` attribute.
@@ -1199,17 +1206,13 @@ fn cta_uniform_blocks(
     st: &Structured,
     succ: &[Vec<usize>],
     pdom: &[Vec<u64>],
+    one_wave: bool,
 ) -> Vec<bool> {
     let n = st.exits.len();
     let non_cta_entry: HashSet<Value> = io
         .inputs
         .iter()
-        .filter(|(_, inp)| {
-            matches!(
-                inp,
-                crate::io::Input::GroupInfo | crate::io::Input::MergedWaveInfo
-            )
-        })
+        .filter(|(_, inp)| matches!(inp, crate::io::Input::MergedWaveInfo))
         .map(|&(v, _)| v)
         .collect();
     let is_scalar_reg = |r: Reg| matches!(r, Reg::S(c) if c < 126) || r == Reg::Scc;
@@ -1278,9 +1281,11 @@ fn cta_uniform_blocks(
             }
         }
     }
-    for (&v, &(_, inst)) in &scalar_defs {
-        if !is_cta_sop(inst) || inst.reads.iter().any(|&(r, _)| !is_scalar_reg(r)) {
-            cta_uni.remove(&v);
+    if !one_wave {
+        for (&v, &(_, inst)) in &scalar_defs {
+            if !is_cta_sop(inst) || inst.reads.iter().any(|&(r, _)| !is_scalar_reg(r)) {
+                cta_uni.remove(&v);
+            }
         }
     }
 
@@ -1332,7 +1337,10 @@ fn cta_uniform_blocks(
             .copied()
             .filter(|v| {
                 if let Some(&(b, inst)) = scalar_defs.get(v) {
-                    !all[b] || !inst.reads.iter().all(|&(_, rv)| cta_uni.contains(&rv))
+                    !all[b]
+                        || !inst.reads.iter().all(|&(r, rv)| {
+                            cta_uni.contains(&rv) || (one_wave && !is_scalar_reg(r))
+                        })
                 } else if let Some(&(b, pi)) = phi_defs.get(v) {
                     let block = &p.blocks[b];
                     !all[b]
@@ -1355,7 +1363,12 @@ fn cta_uniform_blocks(
 /// Per IR block: whether every thread in the CTA executes it uniformly (outside
 /// any per-lane or per-wave branch region or divergent loop cycle). `None` on
 /// indirect exits.
-fn all_lane_blocks(p: &Program, io: &crate::io::Io, st: &Structured) -> Option<Vec<bool>> {
+fn all_lane_blocks(
+    p: &Program,
+    io: &crate::io::Io,
+    st: &Structured,
+    one_wave: bool,
+) -> Option<Vec<bool>> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, e) in st.exits.iter().enumerate() {
@@ -1404,7 +1417,7 @@ fn all_lane_blocks(p: &Program, io: &crate::io::Io, st: &Structured) -> Option<V
             }
         }
     }
-    Some(cta_uniform_blocks(p, io, st, &succ, &pdom))
+    Some(cta_uniform_blocks(p, io, st, &succ, &pdom, one_wave))
 }
 
 /// Host waves meeting at the entry (`meet.0`) and before the exit (`meet.1`) of
@@ -1946,7 +1959,7 @@ impl<'a> Lower<'a> {
                 && !x.target.runs(64)
                 && x.target.runs(32)
             {
-                all_blocks = all_lane_blocks(p, x.io, x.st);
+                all_blocks = all_lane_blocks(p, x.io, x.st, one_wave);
                 let mut lds_ok = s.lds_dwords == 0 || group <= 32;
                 if !lds_ok && let Some(all) = &all_blocks {
                     if p.blocks.iter().enumerate().all(|(b, blk)| {
@@ -1990,7 +2003,7 @@ impl<'a> Lower<'a> {
                         && !insts().any(|i| i.name().starts_with("ds_permute"));
                     if !wants_console_flow
                         && !insts().any(|i| i.name().starts_with("ds_permute"))
-                        && let Some(all) = all_lane_blocks(p, x.io, x.st)
+                        && let Some(all) = all_lane_blocks(p, x.io, x.st, one_wave)
                     {
                         let mut lds_ok = s.lds_dwords == 0
                             || p.blocks.iter().enumerate().all(|(b, blk)| {
@@ -2127,10 +2140,16 @@ impl<'a> Lower<'a> {
             split_lds,
             lds_meet,
             all_blocks,
-            exchange,
+            exchange: exchange.clone(),
             local_waves: x.local_waves,
             local_ok: false,
             uniform,
+            own_bits: match &exchange {
+                Some((false, _)) if x.local_waves == LocalWaves::Off && own_bits_on() => {
+                    super::own_bits::find(p, x.st, std::env::var_os("VICTORY_WAVE_WHY").is_some())
+                }
+                _ => Default::default(),
+            },
             wave_base_global: None,
             bperm: None,
             console_flat: None,
@@ -2563,7 +2582,8 @@ impl<'a> Lower<'a> {
                     shape = Some(sh);
                     self.one_lane.insert(w);
                 }
-                let val = match (shape.map(|sh| self.shape(sh)), plain[j - start]) {
+                let own = self.own_bits.totals.contains(&w);
+                let val = match (shape.map(|sh| self.shape(sh, own)), plain[j - start]) {
                     (Some(Ok(x)), _) => Val::I32(x),
                     (_, true) => continue,
                     (Some(Err(why)), false) => Val::Missing(why),
@@ -2629,7 +2649,7 @@ impl<'a> Lower<'a> {
     /// host's active lanes: the console's result with console lanes; on
     /// another wave size, what the HLSL wave operation the console compiler
     /// expanded gives on that wave.
-    fn shape(&mut self, shape: super::wave::Shape) -> Result<V, Why> {
+    fn shape(&mut self, shape: super::wave::Shape, own: bool) -> Result<V, Why> {
         use super::wave::{Op, Shape};
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
@@ -2787,7 +2807,7 @@ impl<'a> Lower<'a> {
                 )
             }
         };
-        let r = if self.local_waves != LocalWaves::Off || small_exchange {
+        let r = if self.local_waves != LocalWaves::Off || small_exchange || own {
             r
         } else if self.split {
             if !self.console_cf && !self.all_lanes(self.cur_ir) {
@@ -3091,6 +3111,9 @@ impl<'a> Lower<'a> {
                     {
                         Val::I32(self.s.m.i32(0))
                     }
+                    // A scalar parked in a VGPR lane (`ir::unspill`) read on entry
+                    // along an unreachable path: zero, like VGPRs.
+                    None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
                     None => {
                         if std::env::var_os("VICTORY_WHY").is_some() {
                             eprintln!("input {reg:?}");
@@ -6418,9 +6441,15 @@ impl<'a> Lower<'a> {
                     Ok(())
                 }
                 "s_mov_b64" => {
-                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
-                    self.set(lo, Val::I32(a));
-                    self.set(hi, Val::I32(b));
+                    // Each half by itself: two numbers that travel as a pair (two scalars
+                    // parked in neighbouring VGPR lanes, say) need not both have a value.
+                    for (h, v) in [(0, lo), (1, hi)] {
+                        let val = match half(self, 0, h) {
+                            Ok(a) => Val::I32(a),
+                            Err(why) => Val::Missing(why),
+                        };
+                        self.set(v, val);
+                    }
                     Ok(())
                 }
                 "s_cselect_b64" => {
@@ -9337,7 +9366,9 @@ impl<'a> Lower<'a> {
                 {
                     let alike = match v.src.first() {
                         Some(&Operand::Vector { reg, .. }) => {
-                            inst.read(Reg::V(reg)).is_some_and(|x| self.uniform.contains(&x))
+                            inst.read(Reg::V(reg)).is_some_and(|x| {
+                                self.uniform.contains(&x) || self.own_bits.alike.contains(&x)
+                            })
                         }
                         _ => true,
                     };

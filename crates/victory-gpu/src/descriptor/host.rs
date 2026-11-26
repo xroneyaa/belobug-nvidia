@@ -1242,6 +1242,22 @@ impl HostHeap {
         self.keep(index, None);
     }
 
+    fn placed_raw_texture(
+        tex_this: crate::object::This,
+        desc_words: Option<&[u32; 10]>,
+        host_tex: &ID3D12Resource,
+    ) -> *mut std::ffi::c_void {
+        use windows::core::Interface;
+        if desc_words
+            .is_some_and(|w| crate::resource::pc_format(w[0]) == crate::resource::SHARED_EXPONENT)
+        {
+            crate::resource::shared_exponent(tex_this)
+                .map_or(host_tex.as_raw(), |h| h.texture.texture.as_raw())
+        } else {
+            host_tex.as_raw()
+        }
+    }
+
     fn ensure_placed_slot(
         &self,
         index: u32,
@@ -1580,7 +1596,6 @@ impl HostHeap {
         vi: u32,
         generation: u32,
     ) -> Result<Option<crate::object::This>, ()> {
-        use windows::core::Interface;
         let Some(view) = view_at(vi, generation) else {
             self.clear_stale_slot(index);
             return Err(());
@@ -1606,15 +1621,7 @@ impl HostHeap {
             self.set_unmapped_null(index, &view);
             return Ok(None);
         };
-        let raw_tex = if desc_words
-            .as_ref()
-            .is_some_and(|w| crate::resource::pc_format(w[0]) == crate::resource::SHARED_EXPONENT)
-        {
-            crate::resource::shared_exponent(tex_this)
-                .map_or(host_tex.as_raw(), |h| h.texture.texture.as_raw())
-        } else {
-            host_tex.as_raw()
-        };
+        let raw_tex = Self::placed_raw_texture(tex_this, desc_words.as_ref(), host_tex);
         let key = u64::from(generation) << 32 | u64::from(vi);
         self.ensure_placed_slot(index, key, &shader_view, raw_tex);
         Ok(Some(tex_this))
@@ -1903,7 +1910,6 @@ impl HostHeap {
     /// and finds what it reads and writes; `None` if the slot is no longer
     /// one for bindless access (its view went stale, or is not of a buffer).
     fn use_slot(&self, index: u32, (vi, generation): (u32, u32)) -> Option<SlotUse> {
-        use windows::core::Interface;
         let Some(view) = view_at(vi, generation) else {
             self.clear_stale_slot(index);
             return None;
@@ -1952,14 +1958,19 @@ impl HostHeap {
                     self.set_unmapped_null(index, &view);
                     return Some(slot);
                 }
-                if let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view)
+                if let Some(shader_view @ View::Shader(tex_res, desc_words)) = placed_texture(&view)
                     && let Some(host_tex) =
                         crate::resource::host_resource(tex_res as crate::object::This)
                 {
                     if crate::texture::title_written(host_tex) {
                         crate::texture::upload_first(tex_res as crate::object::This, host_tex);
                     }
-                    self.ensure_placed_slot(index, key, &shader_view, host_tex.as_raw());
+                    let raw_tex = Self::placed_raw_texture(
+                        tex_res as crate::object::This,
+                        desc_words.as_ref(),
+                        host_tex,
+                    );
+                    self.ensure_placed_slot(index, key, &shader_view, raw_tex);
                     slot.placed = Some(tex_res);
                     slot.retained = Some(host_tex.clone());
                 } else {
@@ -3880,5 +3891,207 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Clean up `addr_b` too.
         crate::watch::title_memory_remapped(addr_b as usize, 64 << 10);
         assert!(!crate::resource::has_placed_texture(addr_b, &desc));
+    }
+
+    /// Writes packed R9G9B9E5 colors via `ambient::raise` into an R32_UINT UAV
+    /// texture, samples them via both `View::Shader` and `View::Placed`
+    /// `R9G9B9E5_SHAREDEXP` SRVs, and reads back non-zero RGB floats on D3D12.
+    #[test]
+    fn shared_exponent_bridge_and_ambient_preserve_rgb_on_gpu() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        let Some(host) = host() else { return };
+        let _ = host.log_messages();
+
+        const READ_HLSL: &str = r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors = 2)), DescriptorTable(UAV(u0))"
+Texture2D<float4> tex_shader : register(t0);
+Texture2D<float4> tex_placed : register(t1);
+RWByteAddressBuffer out_buf : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    float4 a = tex_shader.Load(int3(0, 0, 0));
+    float4 b = tex_placed.Load(int3(1, 1, 0));
+    out_buf.Store4(0, asuint(a));
+    out_buf.Store4(16, asuint(b));
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: static source and entry point strings; out pointer ours.
+        unsafe {
+            D3DCompile(
+                READ_HLSL.as_ptr().cast(),
+                READ_HLSL.len(),
+                s!("shared_exp_read"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        let device = &host.device;
+        // SAFETY: valid compiled root signature + CS blob and descriptor heap.
+        let (root, pso, views, step) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            let views: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 3,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            let step =
+                device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            (root, pso, views, step as usize)
+        };
+        // SAFETY: live heap.
+        let first = unsafe { views.GetCPUDescriptorHandleForHeapStart() }.ptr;
+        let at = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: first + i * step,
+        };
+
+        // Light target: 16x16 R32_UINT (42), UAV flag (4), just like `light_this`.
+        let light_words: [u32; 14] = [3, 0, 0, 0, 16, 0, 16, 0x0001_0001, 42, 1, 0, 0, 4, 0];
+        let mut light_res = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_at_address(
+                std::ptr::null(),
+                0x2000_0000,
+                light_words.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &RESOURCE_IID,
+                &mut light_res,
+            ),
+            S_OK
+        );
+
+        let shader_view =
+            View::Shader(light_res as usize, Some([67, 4, 5768, 0, 0, 1, 0, 0, 0, 0]));
+        let mut placed_words = [0u32; 16];
+        placed_words[0] = 67; // R9G9B9E5_SHAREDEXP
+        placed_words[1] = 4; // TEX2D
+        placed_words[2] = 5768;
+        placed_words[5] = 1;
+        placed_words[10] = 0x2000_0000;
+        let placed_res_view = placed_texture(&View::Placed(false, light_words, placed_words))
+            .expect("placed R9G9B9E5 view should resolve to R32 target");
+
+        assert!(make(&shader_view, at(0)).is_some());
+        assert!(make(&placed_res_view, at(1)).is_some());
+
+        let (seen, out) = host.shared_buffer(32).unwrap();
+        let raw = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    NumElements: 8,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: live buffer and heap slot.
+        unsafe {
+            device.CreateUnorderedAccessView(&seen, None::<&ID3D12Resource>, Some(&raw), at(2))
+        };
+
+        // List 1 writes light via `ambient::raise` (no depth -> open=1.0 -> level=0.6).
+        let l1 = host.new_list().unwrap();
+        assert!(crate::ambient::raise(&l1, light_res, None));
+        l1.close();
+        host.execute(&[&l1]);
+
+        // List 2 samples via `View::Shader` and `View::Placed` after `flush_dirty_shared_exponents`.
+        let l2 = host.new_list().unwrap();
+        l2.flush_dirty_shared_exponents();
+        // SAFETY: live list, heap, root signature, PSO, and GPU handles.
+        unsafe {
+            l2.list.SetDescriptorHeaps(&[Some(views.clone())]);
+            l2.list.SetComputeRootSignature(&root);
+            l2.list.SetPipelineState(&pso);
+            l2.list
+                .SetComputeRootDescriptorTable(0, views.GetGPUDescriptorHandleForHeapStart());
+            let base = views.GetGPUDescriptorHandleForHeapStart().ptr;
+            l2.list.SetComputeRootDescriptorTable(
+                1,
+                D3D12_GPU_DESCRIPTOR_HANDLE {
+                    ptr: base + 2 * step as u64,
+                },
+            );
+            l2.list.Dispatch(1, 1, 1);
+        }
+        l2.close();
+        host.execute(&[&l2]);
+
+        // SAFETY: GPU finished; `out` points to 32 bytes.
+        let vals = unsafe { std::slice::from_raw_parts(out.cast::<f32>(), 8) };
+        eprintln!("shared_exponent readback: shader={:?} placed={:?}", &vals[..4], &vals[4..]);
+        let msgs = host.log_messages();
+        assert!(msgs.is_none(), "D3D12 errors: {msgs:?}");
+        assert!(vals[0] > 0.5 && vals[1] > 0.5 && vals[2] > 0.5, "got {:?}", vals);
+        assert!(vals[4] > 0.5 && vals[5] > 0.5 && vals[6] > 0.5, "got {:?}", vals);
+
+        slot::<extern "system" fn(This) -> u32>(light_res, 0x10)(light_res);
+    }
+
+    /// Ensures `placed_raw_texture` selects the R9G9B9E5 shared-exponent bridge
+    /// copy whenever the descriptor reads a castable/bridged R32 target as R9G9B9E5.
+    #[test]
+    fn placed_raw_texture_selects_shared_exponent_copy() {
+        use windows::core::Interface;
+        let Some(_host) = host() else { return };
+        let light_words: [u32; 14] = [3, 0, 0, 0, 16, 0, 16, 0x0001_0001, 42, 1, 0, 0, 4, 0];
+        let mut light_res = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_at_address(
+                std::ptr::null(),
+                0x2000_1000,
+                light_words.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &RESOURCE_IID,
+                &mut light_res,
+            ),
+            S_OK
+        );
+        let host_tex = crate::resource::host_resource(light_res).expect("host R32 texture");
+        let shared = crate::resource::shared_exponent(light_res).expect("shared_exponent copy");
+        let shared_raw = shared.texture.texture.as_raw();
+        let se_words: [u32; 10] = [67, 4, 5768, 0, 0, 1, 0, 0, 0, 0];
+        assert_eq!(
+            HostHeap::placed_raw_texture(light_res, Some(&se_words), host_tex),
+            shared_raw
+        );
+        let plain_words: [u32; 10] = [28, 4, 5768, 0, 0, 1, 0, 0, 0, 0];
+        assert_eq!(
+            HostHeap::placed_raw_texture(light_res, Some(&plain_words), host_tex),
+            host_tex.as_raw()
+        );
+        slot::<extern "system" fn(This) -> u32>(light_res, 0x10)(light_res);
     }
 }

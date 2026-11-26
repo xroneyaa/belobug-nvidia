@@ -114,8 +114,19 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
-const BUDGET: Duration = Duration::from_millis(500);
+/// Waiting allowed per title frame, over all threads, unless overridden by
+/// `VICTORY_PIPELINE_WAIT_MS`.
+fn wait_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(500);
+        tracing::info!(millis, "host pipeline wait budget per frame");
+        Duration::from_millis(millis)
+    })
+}
 
 /// The same for passes over the screen (below the title's 30 s watchdog).
 const SCREEN_BUDGET: Duration = Duration::from_secs(20);
@@ -131,6 +142,11 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it as urgent on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    // A still-pending pipeline was requested by the title too. Prewarm it
+    // on the next launch, even if this run never got to finish it.
+    if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
+        super::library::note_used(&p.key);
+    }
     if p.made.get().is_none() {
         enqueue(p, true);
         if p.lost.load(Ordering::Relaxed) {
@@ -140,11 +156,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         // set up what later ones loop over.
         wait(p, crate::frame::current());
     }
-    let made = p.made.get()?.as_ref();
-    if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
-        super::library::note_used(&p.key);
-    }
-    made
+    p.made.get()?.as_ref()
 }
 
 /// Queues `p` for the workers once, or promotes a queued background item to
@@ -195,17 +207,38 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
+/// Whether the frame's wait budget is shared across recording threads so
+/// parallel threads do not wait the full budget each (`VICTORY_PIPELINE_WAIT_SHARED=0`
+/// restores per-thread budgets).
+fn shared_budget() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
+}
+
 /// Waits for `p` while frame `frame` has budget of its kind left.
 fn wait(p: &Pending, frame: u64) {
-    static FRAME: [AtomicU64; 2] = [const { AtomicU64::new(u64::MAX) }; 2];
-    static WAITED_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    static SPENT: [Mutex<(u64, Duration)>; 2] =
+        [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
     let kind = usize::from(p.screen);
-    let budget = [BUDGET, SCREEN_BUDGET][kind];
-    let waited = &WAITED_US[kind];
-    if FRAME[kind].swap(frame, Ordering::Relaxed) != frame {
-        waited.store(0, Ordering::Relaxed);
+    let budget = if p.screen { SCREEN_BUDGET } else { wait_budget() };
+    if budget.is_zero() {
+        return;
     }
-    let left = budget.saturating_sub(Duration::from_micros(waited.load(Ordering::Relaxed)));
+    let shared = shared_budget();
+    let left = {
+        let mut spent = SPENT[kind].lock().unwrap_or_else(|e| e.into_inner());
+        if spent.0 != frame {
+            *spent = (frame, Duration::ZERO);
+        }
+        let left = budget.saturating_sub(spent.1);
+        if shared {
+            spent.1 += left;
+        }
+        left
+    };
+    if left.is_zero() {
+        return;
+    }
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -216,7 +249,16 @@ fn wait(p: &Pending, frame: u64) {
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    waited.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    drop(held);
+    let waited = started.elapsed().min(left);
+    let mut spent = SPENT[kind].lock().unwrap_or_else(|e| e.into_inner());
+    if spent.0 == frame {
+        if shared {
+            spent.1 = spent.1.saturating_sub(left - waited);
+        } else {
+            spent.1 += waited;
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -232,16 +274,30 @@ enum Enqueue {
     Ignored,
 }
 
-/// Priority queues per pipeline kind: live draws/dispatches (`urgent`) always
-/// run ahead of speculative early-list precompiles (`background`).
+/// Priority queues per pipeline kind: live graphics (`urgent_graphics`) run
+/// ahead of live compute (`urgent_compute`) so heavy compute bursts do not
+/// starve world geometry, and both preempt speculative `background` items.
 struct WorkQueue {
-    urgent: VecDeque<Arc<Pending>>,
+    urgent_graphics: VecDeque<Arc<Pending>>,
+    urgent_compute: VecDeque<Arc<Pending>>,
     background: VecDeque<Arc<Pending>>,
 }
 
 impl WorkQueue {
     const fn new() -> Self {
-        Self { urgent: VecDeque::new(), background: VecDeque::new() }
+        Self {
+            urgent_graphics: VecDeque::new(),
+            urgent_compute: VecDeque::new(),
+            background: VecDeque::new(),
+        }
+    }
+
+    fn push_urgent(&mut self, p: &Arc<Pending>) {
+        if p.graphics.is_some() {
+            self.urgent_graphics.push_back(p.clone());
+        } else {
+            self.urgent_compute.push_back(p.clone());
+        }
     }
 
     fn enqueue(&mut self, p: &Arc<Pending>, urgent: bool) -> Enqueue {
@@ -251,13 +307,13 @@ impl WorkQueue {
         if !p.queued.swap(true, Ordering::AcqRel) {
             p.urgent.store(urgent, Ordering::Relaxed);
             if urgent {
-                self.urgent.push_back(p.clone());
+                self.push_urgent(p);
             } else {
                 self.background.push_back(p.clone());
             }
             Enqueue::New
         } else if urgent && !p.urgent.swap(true, Ordering::Relaxed) {
-            self.urgent.push_back(p.clone());
+            self.push_urgent(p);
             Enqueue::Promoted
         } else {
             Enqueue::Ignored
@@ -265,7 +321,12 @@ impl WorkQueue {
     }
 
     fn pop(&mut self, urgent_only: bool) -> Option<Arc<Pending>> {
-        while let Some(p) = self.urgent.pop_front() {
+        while let Some(p) = self.urgent_graphics.pop_front() {
+            if !p.claimed.swap(true, Ordering::AcqRel) {
+                return Some(p);
+            }
+        }
+        while let Some(p) = self.urgent_compute.pop_front() {
             if !p.claimed.swap(true, Ordering::AcqRel) {
                 return Some(p);
             }
@@ -373,11 +434,7 @@ fn worker(i: usize, role: Role) -> bool {
             if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                 drained();
             } else if !role.urgent_only {
-                let urgent_waiting =
-                    !work.queue.lock().unwrap_or_else(|e| e.into_inner()).urgent.is_empty();
-                if !urgent_waiting {
-                    super::library::save(false);
-                }
+                super::library::save(false);
             }
         }
     });
@@ -474,5 +531,47 @@ mod tests {
         let third = q.pop(false).expect("remaining background item");
         assert!(Arc::ptr_eq(&third, &bg_only));
         assert!(q.pop(false).is_none());
+    }
+
+    #[test]
+    fn urgent_graphics_preempts_urgent_compute() {
+        let mut q = WorkQueue::new();
+        let bg = Arc::new(Pending::new(Vec::new(), None));
+        let promoted_gfx = Arc::new(Pending::new(Vec::new(), Some(Box::default())));
+        let compute_1 = Arc::new(Pending::new(Vec::new(), None));
+        let compute_2 = Arc::new(Pending::new(Vec::new(), None));
+        let gfx = Arc::new(Pending::new(Vec::new(), Some(Box::default())));
+
+        assert!(q.enqueue(&bg, false) == Enqueue::New);
+        assert!(q.enqueue(&promoted_gfx, false) == Enqueue::New);
+        assert!(q.enqueue(&compute_1, true) == Enqueue::New);
+        assert!(q.enqueue(&compute_2, true) == Enqueue::New);
+        assert!(q.enqueue(&gfx, true) == Enqueue::New);
+        assert!(q.enqueue(&promoted_gfx, true) == Enqueue::Promoted);
+
+        assert!(Arc::ptr_eq(&q.pop(true).expect("graphics first"), &gfx));
+        assert!(Arc::ptr_eq(
+            &q.pop(true).expect("promoted graphics ahead of compute"),
+            &promoted_gfx
+        ));
+        assert!(Arc::ptr_eq(&q.pop(true).expect("first compute"), &compute_1));
+        assert!(Arc::ptr_eq(&q.pop(true).expect("second compute"), &compute_2));
+        assert!(q.pop(true).is_none());
+        assert!(Arc::ptr_eq(&q.pop(false).expect("background last"), &bg));
+        assert!(q.pop(false).is_none());
+    }
+
+    #[test]
+    fn pending_request_marks_pipeline_used_even_when_unmade() {
+        let mut inner = Pending::new(Vec::new(), None);
+        inner.key = format!("test-unmade-prewarm-{}", std::process::id());
+        inner.claimed.store(true, Ordering::Relaxed);
+        inner.lost.store(true, Ordering::Relaxed);
+        let p = Arc::new(inner);
+
+        assert!(ready(&p).is_none());
+        assert!(p.made.get().is_none());
+        assert!(p.used.load(Ordering::Relaxed));
+        assert!(super::super::library::wanted_early(&p.key));
     }
 }

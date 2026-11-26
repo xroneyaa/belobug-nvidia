@@ -828,6 +828,32 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     Some(Shape::Prefix(op, src, mask, ident, inclusive))
 }
 
+/// `WaveActiveBitOr(v7)` into s7 as the console compiler expands it: every lane takes part,
+/// those outside the saved EXEC (s[4:5]) with 0.
+#[cfg(test)]
+pub(super) const WAVE_OR_V7_TO_S7: [u32; 20] = [
+    0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+    0xD501_0001,
+    0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
+    0x3802_02E9,
+    0xDE54_C101, // v_or_b32 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+    0x3802_02E9,
+    0x9360_1201, // v_or_b32 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+    0x3802_02E9,
+    0x0009_2401, // v_or_b32 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+    0x3802_02FA,
+    0xFF09_4001, // v_or_b32 v1, v1, v1 row_mirror bound_ctrl:1
+    0xD778_0002,
+    0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+    0x3802_0302, // v_or_b32 v1, v2, v1
+    0xD760_0007,
+    0x0001_4101, // v_readlane_b32 s7, v1, 32
+    0x3802_0207, // v_or_b32 v1, s7, v1
+    0xD760_0007,
+    0x0001_0101, // v_readlane_b32 s7, v1, 0
+    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

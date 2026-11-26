@@ -2192,4 +2192,261 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn ambient_depth_and_table_shared_exponent_preserve_rgb_on_gpu() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::s;
+
+        let Some(host) = crate::host::host() else { return };
+        let _ = host.log_messages();
+
+        const READ_HLSL: &str = r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors = 3)), DescriptorTable(UAV(u0))"
+Texture2D<float4> tex_shader : register(t0);
+Texture2D<float4> tex_table_placed : register(t1);
+Texture2D<float4> tex_bindless_placed : register(t2);
+RWByteAddressBuffer out_buf : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    float4 a = tex_shader.Load(int3(0, 0, 0));
+    float4 b = tex_table_placed.Load(int3(1, 1, 0));
+    float4 c = tex_bindless_placed.Load(int3(2, 2, 0));
+    out_buf.Store4(0, asuint(a));
+    out_buf.Store4(16, asuint(b));
+    out_buf.Store4(32, asuint(c));
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: static HLSL source and valid output blob.
+        unsafe {
+            D3DCompile(
+                READ_HLSL.as_ptr().cast(),
+                READ_HLSL.len(),
+                s!("ambient_depth_table_read"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        let device = &host.device;
+        // SAFETY: valid compiled root signature + CS blob.
+        let (root, pso) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+
+        let light_mem = crate::resource::Memory::zeroed(256 << 10, 64 << 10).unwrap();
+        let depth_mem = crate::resource::Memory::zeroed(512 << 10, 64 << 10).unwrap();
+        let light_res = crate::resource::test_texture_at(light_mem.address(), 16, 16, 42, 0, 4);
+        let depth_res = crate::resource::test_texture_at(depth_mem.address(), 16, 16, 19, 0, 2);
+        let light_addr = light_mem.address();
+        let _ = &light_mem;
+        let light_host = crate::resource::host_resource(light_res).unwrap();
+        let depth_host = crate::resource::host_resource(depth_res).unwrap();
+
+        let (out_buf, out_ptr) = host.shared_buffer(64).unwrap();
+        // SAFETY: mapped upload/readback shared buffer of 64 bytes.
+        unsafe { out_ptr.cast::<[u32; 12]>().write([0; 12]) };
+
+        let (title_heap, base) = crate::descriptor::test_shader_heap(8);
+        let slot_handle = |i: u64| base + i * 32;
+        let host_heap = crate::descriptor::heap(title_heap).host_arc().unwrap();
+
+        // Slot 0: View::Shader on light_res (R9G9B9E5).
+        let srv_host_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: 40-byte POD view desc.
+        let srv_words: [u32; 10] = unsafe {
+            std::ptr::from_ref(&srv_host_desc)
+                .cast::<[u32; 10]>()
+                .read()
+        };
+        crate::descriptor::create_srv(std::ptr::null(), light_res, &srv_words, slot_handle(0));
+
+        // Slot 1 & 2: View::Placed at light_addr (R9G9B9E5).
+        let placed_res_words: [u32; 14] = [
+            3, 0, 0, 0, 16, 0, 16, 0x0001_0001,
+            DXGI_FORMAT_R9G9B9E5_SHAREDEXP.0 as u32, 1, 0, 0, 4, 0,
+        ];
+        let mut placed_view_words = [0u32; 16];
+        placed_view_words[..10].copy_from_slice(&srv_words);
+        placed_view_words[10] = light_addr as u32;
+        placed_view_words[11] = (light_addr >> 32) as u32;
+        crate::descriptor::create_placed_srv(
+            std::ptr::null(),
+            &placed_res_words,
+            &placed_view_words,
+            slot_handle(1),
+        );
+        crate::descriptor::create_placed_srv(
+            std::ptr::null(),
+            &placed_res_words,
+            &placed_view_words,
+            slot_handle(2),
+        );
+
+        let step = unsafe {
+            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        };
+        // Slot 3: output UAV on host heap directly.
+        // SAFETY: valid heap handle and resource.
+        unsafe {
+            let cpu_start = host_heap.heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            device.CreateUnorderedAccessView(
+                &out_buf,
+                None,
+                Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            FirstElement: 0,
+                            NumElements: 16,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                            ..Default::default()
+                        },
+                    },
+                }),
+                D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: cpu_start + 3 * usize::try_from(step).unwrap(),
+                },
+            );
+        }
+
+        let l0 = host.new_list().unwrap();
+        // SAFETY: valid DSV heap, depth resource, and transitions.
+        let _dsv_heap: ID3D12DescriptorHeap = unsafe {
+            let dsv_heap: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            let dsv = dsv_heap.GetCPUDescriptorHandleForHeapStart();
+            device.CreateDepthStencilView(
+                &*depth_host,
+                Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+                    Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                    ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                    ..Default::default()
+                }),
+                dsv,
+            );
+            let b_depth_w = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(Some(depth_host.clone())),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: D3D12_RESOURCE_STATE_COMMON,
+                        StateAfter: D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    }),
+                },
+            };
+            l0.list.ResourceBarrier(&[b_depth_w]);
+            l0.list
+                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None);
+            let b_depth = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(Some(depth_host.clone())),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                        StateAfter: D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    }),
+                },
+            };
+            l0.list.ResourceBarrier(&[b_depth]);
+            dsv_heap
+        };
+        let _ = &light_host;
+        l0.close();
+        host.execute(&[&l0]);
+
+        // l1: run ambient::raise WITH depth.
+        let l1 = host.new_list().unwrap();
+        assert!(crate::ambient::raise(&l1, light_res, Some(depth_res)));
+        l1.close();
+        host.execute(&[&l1]);
+
+        // l2: mirror table slots (0, 1) with for_draw=true, bindless slot (2) with for_draw=false + prepare_bindless_record.
+        let l2 = host.new_list().unwrap();
+        let _ = host_heap.mirror(0, slot_handle(0), true);
+        let _ = host_heap.mirror(1, slot_handle(1), true);
+        let _ = host_heap.mirror(2, slot_handle(2), false);
+        host_heap.prepare_bindless_record(&l2);
+        l2.flush_dirty_shared_exponents();
+        // SAFETY: valid heap, root sig, PSO, and tables.
+        unsafe {
+            let gpu_start = host_heap.heap.GetGPUDescriptorHandleForHeapStart().ptr;
+            let gpu_at = |i: u64| D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: gpu_start + i * u64::from(step),
+            };
+            l2.list.SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+            l2.list.SetComputeRootSignature(&root);
+            l2.list.SetPipelineState(&pso);
+            l2.list.SetComputeRootDescriptorTable(0, gpu_at(0));
+            l2.list.SetComputeRootDescriptorTable(1, gpu_at(3));
+            l2.list.Dispatch(1, 1, 1);
+        }
+        l2.close();
+        host.execute(&[&l2]);
+
+        // SAFETY: GPU finished writing 12 u32s.
+        let words = unsafe { out_ptr.cast::<[u32; 12]>().read_volatile() };
+        let floats: Vec<f32> = words.iter().copied().map(f32::from_bits).collect();
+        assert_eq!(host.log_messages(), None);
+        assert!(
+            floats[0] > 0.1 && floats[1] > 0.1 && floats[2] > 0.1,
+            "shader RGB: {:?}",
+            &floats[0..4]
+        );
+        assert!(floats[4] > 0.1 && floats[5] > 0.1 && floats[6] > 0.1, "table placed RGB: {:?}", &floats[4..8]);
+        assert!(floats[8] > 0.1 && floats[9] > 0.1 && floats[10] > 0.1, "bindless placed RGB: {:?}", &floats[8..12]);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for obj in [light_res, depth_res, title_heap] {
+            assert_eq!(release(obj), 0);
+        }
+    }
+
 }
