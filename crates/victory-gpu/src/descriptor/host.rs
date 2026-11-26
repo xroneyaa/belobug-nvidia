@@ -2690,10 +2690,15 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     _ => None,
                 };
             };
-            if let Some(twin) = crate::resource::depth_twin(resource) {
-                return crate::twin::view(twin, desc.as_ref(), at).map(Some);
-            }
-            let mut desc = desc.as_ref().map(uav_desc);
+            let desc = desc.as_ref().map(uav_desc);
+            let twin = crate::resource::depth_twin(resource);
+            let (texture, mut desc) = if let Some(twin) = twin.as_ref()
+                && let Some((twin_tex, view)) = crate::twin::view_resource(twin, desc.as_ref())
+            {
+                (twin_tex, Some(view))
+            } else {
+                (texture, desc)
+            };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true, false) {
                 return None;
             }

@@ -910,11 +910,41 @@ pub(crate) struct HostTexture {
     pub(crate) written: std::sync::atomic::AtomicU64,
     /// Planes shaders write as images, for depth textures the title also
     /// writes so ([`crate::twin`]); made on the first such view.
-    pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
+    pub(crate) twin: std::sync::OnceLock<Option<std::sync::Arc<crate::twin::Twin>>>,
     /// Whether this resource was created with working R9G9B9E5 casts.
     pub(crate) shared_cast: bool,
     /// Read-only reinterpret copy when the host cannot cast R32 to R9G9B9E5.
     pub(crate) shared_copy: std::sync::OnceLock<Option<SharedExponentCopy>>,
+}
+
+#[cfg(windows)]
+impl HostTexture {
+    /// Wraps an auxiliary host-owned texture (`shared_copy`, depth twin) and tracks its memory.
+    pub(crate) fn auxiliary(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+    ) -> std::sync::Arc<Self> {
+        let bytes = allocation_bytes(&texture);
+        crate::memstat::add(&crate::memstat::HOST_TEXTURES, bytes);
+        crate::memstat::add(&crate::memstat::HOST_TEXTURE_COUNT, 1);
+        #[cfg(feature = "diagnostics")]
+        census(&texture, bytes as i64);
+        std::sync::Arc::new(HostTexture {
+            texture,
+            state: std::sync::atomic::AtomicU32::new(state),
+            bytes,
+            slot: None,
+            skip: 0,
+            placed: false,
+            used: std::sync::atomic::AtomicU64::new(crate::queue::presented()),
+            r32_target: false,
+            shared_dirty: Default::default(),
+            written: Default::default(),
+            twin: Default::default(),
+            shared_cast: false,
+            shared_copy: Default::default(),
+        })
+    }
 }
 
 /// Bit-preserving R9G9B9E5 copy of a written 32-bit texture together with its
@@ -1254,26 +1284,7 @@ pub(crate) fn shared_exponent<'a>(this: This) -> Option<&'a SharedExponentCopy> 
             crate::host::name(&buffer, || {
                 format!("shared-exponent bridge {from_bytes}B")
             });
-            let bytes = allocation_bytes(&texture);
-            crate::memstat::add(&crate::memstat::HOST_TEXTURES, bytes);
-            crate::memstat::add(&crate::memstat::HOST_TEXTURE_COUNT, 1);
-            #[cfg(feature = "diagnostics")]
-            census(&texture, bytes as i64);
-            let shared_tex = std::sync::Arc::new(HostTexture {
-                texture,
-                state: std::sync::atomic::AtomicU32::new(0xc0),
-                bytes,
-                slot: None,
-                skip: 0,
-                placed: false,
-                used: std::sync::atomic::AtomicU64::new(crate::queue::presented()),
-                r32_target: false,
-                shared_dirty: Default::default(),
-                written: Default::default(),
-                twin: Default::default(),
-                shared_cast: false,
-                shared_copy: Default::default(),
-            });
+            let shared_tex = HostTexture::auxiliary(texture, 0xc0);
             copy.shared_dirty
                 .store(true, std::sync::atomic::Ordering::Release);
             {
@@ -1465,16 +1476,23 @@ pub(crate) fn host_resource<'a>(
 /// The twins of a depth texture the title also writes as an image (see
 /// [`crate::twin`]), made on first use; `None` for other textures.
 #[cfg(windows)]
-pub(crate) fn depth_twin<'a>(this: This) -> Option<&'a crate::twin::Twin> {
+pub(crate) fn depth_twin(this: This) -> Option<std::sync::Arc<crate::twin::Twin>> {
     if this.is_null() {
         return None;
     }
     let r = resource(this);
-    if !crate::twin::wanted(r.desc.format, r.desc.flags) {
+    if r.desc.dimension == BUFFER
+        || r.desc.sample_count > 1
+        || !crate::twin::wanted(r.desc.format, r.desc.flags)
+    {
         return None;
     }
     let host = r.ensure_host()?;
-    host.twin.get_or_init(|| crate::twin::make(&host.texture)).as_ref()
+    host.twin
+        .get_or_init(|| {
+            crate::twin::make(r.desc.format, r.desc.sample_count, &host.texture).map(std::sync::Arc::new)
+        })
+        .clone()
 }
 
 /// A title texture's host copy, shared, for a list to hold.

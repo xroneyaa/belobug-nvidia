@@ -673,6 +673,8 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Depth textures with colour twins used in this recording and per-side state.
+    twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
     /// R32 textures copied to their shared-exponent read view since the last
     /// write transition or GPU write in this recording.
     shared_synced: Mutex<std::collections::HashSet<usize>>,
@@ -766,6 +768,15 @@ type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
+
+struct TwinUse {
+    depth: std::sync::Arc<crate::resource::HostTexture>,
+    twin: std::sync::Arc<crate::twin::Twin>,
+    needs: [bool; 2],
+    behind: [Option<bool>; 2],
+    writing: bool,
+    late: bool,
+}
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -1110,6 +1121,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                twins: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 kept: Mutex::default(),
                 work: Mutex::default(),
@@ -1991,6 +2003,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.twins_to_depth();
         // The host closes no list with queries running; their title ends,
         // in a later list, are dropped (`end_query`).
         for (heap, kind, index, _) in self.queries.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
@@ -2042,6 +2055,7 @@ impl HostList {
             chunks.barrier = false;
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.shared_synced.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.r32_dirty.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.r32_uav.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2216,6 +2230,164 @@ impl HostList {
         let dirty = self.r32_dirty.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&key);
         let synced = self.shared_synced.lock().unwrap_or_else(|e| e.into_inner()).contains(&key);
         (uav, dirty, synced)
+    }
+
+    fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+        let wanted = legal_state(&copy.texture, wanted);
+        if let Some(before) = self.transition_copy(copy.clone(), wanted) {
+            let barrier = transition(
+                &copy.texture,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(wanted as i32),
+            );
+            // SAFETY: open list and live texture.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+
+    fn twin_copy(
+        &self,
+        depth: &std::sync::Arc<crate::resource::HostTexture>,
+        twin: &crate::twin::Twin,
+        to_twin: bool,
+    ) {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+        let (from, to) = if to_twin { (depth, &twin.colour) } else { (&twin.colour, depth) };
+        self.settle(from, COPY_SOURCE);
+        self.settle(to, COPY_DEST);
+        crate::twin::record_copy(&self.list, &depth.texture, twin, to_twin);
+        self.settle(&twin.colour, UNORDERED_ACCESS);
+    }
+
+    fn pass_plane(&self, depth: &std::sync::Arc<crate::resource::HostTexture>, twin: &crate::twin::Twin) {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        const DEPTH_WRITE: u32 = 0x10;
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+        let Some(plane) = &twin.plane else { return };
+        self.settle(depth, DEPTH_WRITE);
+        self.settle(plane, PIXEL_SHADER_RESOURCE);
+        crate::twin::record_plane_pass(&self.list, &depth.texture, &plane.texture);
+        self.settle(plane, UNORDERED_ACCESS);
+    }
+
+    /// Syncs a depth texture (`colour == false`) or its writable colour twin(s)
+    /// (`colour == true`) within this list and marks cross-list needs. Returns false
+    /// when `resource` has no twin.
+    pub(crate) fn twin_use(&self, resource: crate::object::This, colour: bool, write: bool) -> bool {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        let Some(twin) = crate::resource::depth_twin(resource) else { return false };
+        let Some(depth) = crate::resource::host_copy(resource) else { return false };
+        let side = usize::from(colour);
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let u = twins
+            .entry(std::sync::Arc::as_ptr(&twin) as usize)
+            .or_insert_with(|| TwinUse {
+                depth: depth.clone(),
+                twin: twin.clone(),
+                needs: [false; 2],
+                behind: [None; 2],
+                writing: false,
+                late: false,
+            });
+        let copy = match u.behind[side] {
+            Some(behind) => behind,
+            None => {
+                u.needs[side] = true;
+                false
+            }
+        };
+        u.behind[side] = Some(false);
+        match (write, colour) {
+            (true, true) => u.writing = true,
+            (true, false) => u.behind[1] = Some(true),
+            (false, _) => {}
+        }
+        if copy && !colour && twin.plane.is_some() {
+            u.late = true;
+        }
+        drop(twins);
+        if copy {
+            self.twin_copy(&depth, &twin, colour);
+        } else if colour {
+            self.settle(&twin.colour, UNORDERED_ACCESS);
+        }
+        if colour && let Some(plane) = &twin.plane {
+            self.settle(plane, UNORDERED_ACCESS);
+        }
+        true
+    }
+
+    /// Commits pending twin UAV writes from the draw/dispatch that just ran.
+    pub(crate) fn twins_written(&self) {
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        for u in twins.values_mut().filter(|u| u.writing) {
+            u.writing = false;
+            u.behind[0] = Some(true);
+        }
+    }
+
+    /// Records post-work `R9G9B9E5` dirtying and pending twin UAV writes.
+    pub(crate) fn note_work_done(&self, targets: &[usize], uavs: bool) {
+        self.note_shared_post_work(targets, uavs);
+        self.twins_written();
+    }
+
+    /// Flushes any dirty depth-plane twins (`twin.plane`) immediately via `pass_plane`.
+    /// Returns true if any `plane` pass recorded graphics state onto the list.
+    pub(crate) fn resolve_twin_planes(&self) -> bool {
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        if twins.is_empty() {
+            return false;
+        }
+        let pending: Vec<_> = twins
+            .values_mut()
+            .filter(|u| u.twin.plane.is_some() && (u.behind[0] == Some(true) || u.late))
+            .map(|u| {
+                let copy = u.behind[0] == Some(true);
+                u.behind[0] = Some(false);
+                u.late = false;
+                (u.depth.clone(), u.twin.clone(), copy)
+            })
+            .collect();
+        drop(twins);
+        if pending.is_empty() {
+            return false;
+        }
+        for (depth, twin, copy) in &pending {
+            if *copy {
+                self.twin_copy(depth, twin, false);
+            }
+            self.pass_plane(depth, twin);
+        }
+        true
+    }
+
+    fn twins_to_depth(&self) {
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        if twins.is_empty() {
+            return;
+        }
+        let written: Vec<_> = twins
+            .values_mut()
+            .filter(|u| u.behind[0] == Some(true) || u.late)
+            .map(|u| {
+                let copy = u.behind[0] == Some(true);
+                u.behind[0] = Some(false);
+                u.late = false;
+                (u.depth.clone(), u.twin.clone(), copy)
+            })
+            .collect();
+        drop(twins);
+        for (depth, twin, copy) in &written {
+            if *copy {
+                self.twin_copy(depth, twin, false);
+            }
+            self.pass_plane(depth, twin);
+            self.settle(depth, SHADER_RESOURCE);
+        }
     }
 
     /// Tracks a host-owned copy just like a title texture, including its
@@ -2432,11 +2604,64 @@ impl HostList {
             self.keep(&shared.buffer);
             shared_work.push((source, shared, sb));
         }
+        let mut twin_syncs = Vec::new();
+        {
+            let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+            for u in twins.values() {
+                let real = u.twin.behind.load(Ordering::Relaxed);
+                let mut behind = [real & 1 != 0, real & 2 != 0];
+                for side in [0, 1] {
+                    if u.needs[side] && behind[side] {
+                        twin_syncs.push((u.depth.clone(), u.twin.clone(), side == 1));
+                        behind = [false; 2];
+                    }
+                }
+                let left = [0, 1].map(|side| u.behind[side].unwrap_or(behind[side]));
+                let left = u32::from(left[0]) | (u32::from(left[1]) << 1);
+                u.twin.behind.store(left, Ordering::Relaxed);
+            }
+        }
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let post_barriers: Vec<D3D12_RESOURCE_BARRIER> = states
+        let mut twin_pre = Vec::new();
+        let mut twin_restore = Vec::new();
+        let mut copying = std::collections::HashMap::<usize, u32>::new();
+        for (depth, twin, to_twin) in &twin_syncs {
+            let (from, to) = if *to_twin {
+                (depth, &twin.colour)
+            } else {
+                (&twin.colour, depth)
+            };
+            for (tex, wanted) in [(from, COPY_SOURCE), (to, COPY_DEST)] {
+                let key = std::sync::Arc::as_ptr(tex) as usize;
+                let real = copying.get(&key).copied().unwrap_or_else(|| tex.state.load(Ordering::Relaxed));
+                copying.insert(key, wanted);
+                if real != wanted {
+                    twin_pre.push(transition(
+                        &tex.texture,
+                        D3D12_RESOURCE_STATES(real as i32),
+                        D3D12_RESOURCE_STATES(wanted as i32),
+                    ));
+                    if !states.contains_key(&key) {
+                        twin_restore.push(transition(
+                            &tex.texture,
+                            D3D12_RESOURCE_STATES(wanted as i32),
+                            D3D12_RESOURCE_STATES(tex.state.load(Ordering::Relaxed) as i32),
+                        ));
+                    }
+                }
+            }
+            self.keep(&depth.texture);
+            self.keep(&twin.colour.texture);
+            if let Some(through) = &twin.through {
+                self.keep(through);
+            }
+        }
+        let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {
+                let key = std::sync::Arc::as_ptr(copy) as usize;
                 let real = copy.state.swap(*last, Ordering::Relaxed);
+                let real = copying.get(&key).copied().unwrap_or(real);
                 (real != *first).then(|| {
                     transition(
                         &copy.texture,
@@ -2446,7 +2671,9 @@ impl HostList {
                 })
             })
             .collect();
-        if uploads.is_empty() && shared_work.is_empty() && post_barriers.is_empty() {
+        drop(states);
+        post_barriers.extend(twin_restore);
+        if uploads.is_empty() && shared_work.is_empty() && twin_syncs.is_empty() && post_barriers.is_empty() {
             for copy in r32_written {
                 copy.shared_dirty.store(true, Ordering::Release);
             }
@@ -2522,6 +2749,12 @@ impl HostList {
                                 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         ),
                     ]);
+                }
+                if !twin_pre.is_empty() {
+                    list.ResourceBarrier(&twin_pre);
+                }
+                for (depth, twin, to_twin) in &twin_syncs {
+                    crate::twin::record_copy(list, &depth.texture, twin, *to_twin);
                 }
                 if !post_barriers.is_empty() {
                     list.ResourceBarrier(&post_barriers);

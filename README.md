@@ -22,7 +22,7 @@ intact.
 | Target adapters | NVIDIA RTX 3060 Ti 8 GB (Wave32 `32-32`, capped descriptor heap fallback); prior base also ran on AMD RX 9070 XT 16 GB (Wave64) |
 | Shader translation (Wave32 `32-32`) | **25,599 / 25,889** programs emit DXIL across 26,503 containers in the shader archive (614 duplicates skipped; 290 unsupported, `14,246 / 14,247` VP) |
 | Live in-game status (RTX 3060 Ti, prior runs) | Menus reached `29.9–30.8 fps` (`shadow::sweep` stalls eliminated); world runs reached `1+ fps`, with a deferred-lighting resolve shader dropped and stale `R9G9B9E5_SHAREDEXP` syncs causing yellow/black-sphere frames |
-| Live in-game status (after 2026-11-26 Stage 3 lighting & shader pass) | **Ready for live re-test** (`victory-gpu`: `141 passed; 0 failed; 4 ignored`) |
+| Live in-game status (after 2026-11-26 Stage 3 & Stage 4 lighting, depth/stencil twin & shader pass) | **Ready for live re-test** (`victory-gpu`: `144 passed; 0 failed; 4 ignored`; `release` & `diag` built) |
 | Ray tracing (`VICTORY_RAYS`) | Disabled by default; BVH builder/wind compute passes stay skipped unless opted in |
 
 ### What this fork changes
@@ -47,6 +47,16 @@ intact.
   probes padded view heaps at startup and clamps view indices to the null slot
   on capped heaps (`2^18` dynamic slots), instead of failing shader translation
   or faulting out-of-bounds descriptors.
+- **Depth/stencil UAV twins & read-only DSV/SRV barrier tracking (`twin.rs`, `resource.rs`, `descriptor/host.rs`, `host.rs`, `list.rs`, `draw.rs`)**:
+  extends depth UAV twins beyond `118..=120` to single-plane `R16_TYPELESS` (`53`)
+  and `R32_TYPELESS` (`39`) depth resources (including shadow arrays and mips
+  via `CopyResource`) alongside `R24G8_TYPELESS` / `R32G8X24_TYPELESS` (`44` / `19`);
+  syncs stencil (`Plane 1` <-> `R8_TYPELESS`) through a `DEFAULT` staging buffer
+  via `CopyTextureRegion` so NVIDIA GPUs without `PSSpecifiedStencilRefSupported`
+  (`SV_StencilRef`) no longer drop stencil transfers, alongside full-array
+  `SV_Depth` depth-plane resolves (`PlanePass`); tracks cross-list `prelude`,
+  `copy_resource`, `copy_texture_region`, and `clear_dsv` dirtiness; and transitions
+  bound read-only DSVs that shaders also sample as SRVs to `DEPTH_READ | SHADER_RESOURCE`.
 
 #### Pipeline queue, descriptor sync, CPU FPS & VRAM/commit fixes (`victory-gpu`)
 - **Graphics-first non-stalling pipeline scheduling (`crates/victory-gpu/src/pipeline/make.rs`, `library.rs`)**:
@@ -127,21 +137,18 @@ All checks below ran after the latest code edits with `--locked` on Windows 11 +
 
 - `cargo check --workspace --all-targets --locked`: **passed**
 - `cargo build --release --locked` and `cargo build --profile diag -p victory --features diagnostics --locked`: **passed**
-- `victory-gpu` (`-- --test-threads=1`): **`141 passed; 0 failed; 4 ignored`** (including `shared_exponent_post_work_and_excluding_keep_sync_accurate`)
-- `victory-shader` (`-- --test-threads=1`): **`279 passed; 4 failed; 6 ignored`** (same 4 pre-existing Wave32 `emit::valu_tests` failures listed below; `ir::tests::spilled_lanes_become_scalars` covering separated save-pairs passed)
-- Other workspace crates:
-  `victory` (`1 passed`), `victory-core` (`11 passed`), `victory-formats`
-  (`24 passed; 4 ignored`), `victory-game` (`2 passed`), `victory-pe`
-  (`7 passed`), `victory-pipeline` (`4 passed`), `victory-loader`
-  (`22 passed; 1 ignored` lib + `4 passed` across `crash_log`, `load_probe`,
-  and `title_dlls`).
+- `victory-gpu` (`-- --test-threads=1`): **`144 passed; 0 failed; 4 ignored`** (including `twin::tests::wanted_accepts_single_plane_and_depth_stencil_formats`, `twin::tests::stencil_buffer_copy_and_array_depth_twins_work_without_stencil_ref`, `draw::group_limit_tests::dsv_access_detects_read_only_depth_and_stencil`, and `shared_exponent_post_work_and_excluding_keep_sync_accurate`); `twin::tests` also passed **`2 passed; 0 failed`** under `--features diagnostics` with `VICTORY_D3D12_DEBUG=1`
+- Unchanged in this `victory-gpu` commit (last run on `2cea5a1`):
+  `victory-shader` (`279 passed; 4 failed; 6 ignored` — same 4 pre-existing Wave32 `emit::valu_tests` failures listed below; `ir::tests::spilled_lanes_become_scalars` passed), `victory` (`1 passed`), `victory-core` (`11 passed`), `victory-formats` (`24 passed; 4 ignored`), `victory-game` (`2 passed`), `victory-pe` (`7 passed`), `victory-pipeline` (`4 passed`), `victory-loader` (`22 passed; 1 ignored` lib + `4 passed` across `crash_log`, `load_probe`, and `title_dlls`)
 - `cargo-clippy.exe` is not installed on this toolchain.
 
 ### Known problems
 
-- **Unverified in-game after the 2026-11-26 Stage 3 lighting & shader pass**:
+- **Unverified in-game after the 2026-11-26 Stage 3 & Stage 4 passes**:
   live playback has not yet been re-tested with the `ir::unspill` paired
-  mask-save fix and post-draw/dispatch `R9G9B9E5_SHAREDEXP` sync fix.
+  mask-save fix, post-draw/dispatch `R9G9B9E5_SHAREDEXP` sync fix, expanded
+  depth/stencil UAV twins (`R16_TYPELESS`/`R32_TYPELESS` + buffer-backed stencil
+  sync without `SV_StencilRef`), and read-only DSV+SRV barrier handling.
 - **Wave32 unsupported console shaders**: across the shader archive,
   `290` of `25,889` tracked programs still fail to emit DXIL (`195`
   untracked-SGPR-address stages, `71` mesh shaders exceeding 32 KiB, `14`

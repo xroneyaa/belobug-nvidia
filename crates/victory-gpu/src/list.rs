@@ -678,6 +678,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if crate::texture::title_written(from) {
                 crate::texture::upload(&list, src, from);
             }
+            list.twin_use(src, false, false);
+            list.twin_use(dst, false, true);
             ensure_state(&list, dst, COPY_DEST);
             ensure_state(&list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -995,6 +997,7 @@ extern "system" fn copy_texture_region(
                 return;
             };
             crate::texture::upload(&list, src.resource, from_tex);
+            list.twin_use(src.resource, false, false);
             ensure_state(&list, src.resource, COPY_SOURCE);
             let mut to_location = dst;
             to_location.resource = buffer.as_raw().cast_const().cast();
@@ -1091,10 +1094,12 @@ extern "system" fn copy_texture_region(
             if crate::texture::title_written(texture) {
                 crate::texture::upload(&list, src.resource, texture);
             }
+            list.twin_use(src.resource, false, false);
             ensure_state(&list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
             from.footprint.offset = u64::from(host_src_sub);
         }
+        list.twin_use(dst.resource, false, true);
         ensure_state(&list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
@@ -1309,6 +1314,7 @@ extern "system" fn clear_dsv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const DEPTH_WRITE: u32 = 0x10;
+        list.twin_use(record.resource, false, true);
         ensure_state(&list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
