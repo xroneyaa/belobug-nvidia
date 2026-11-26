@@ -691,6 +691,8 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let now = std::time::Instant::now();
         g.pins.retain(|&(_, _, until)| until > now);
     }
+    let holes_before = g.holes.len();
+    let mut all_clean = first < last;
     let mut run: Option<usize> = None;
     for block in first..=last {
         let open = block < last
@@ -700,6 +702,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         if open {
             g.recheck.remove(&block);
             if g.pinned(block) {
+                all_clean = false;
                 // The kernel may be writing it: left writable, reported
                 // written at every check until the pin ends.
                 written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
@@ -712,13 +715,17 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 continue;
             }
         } else if block < last {
+            all_clean &= g.clean.contains(&block);
             g.recheck.remove(&block);
         }
         if let Some(from) = run.take() {
             protect(&mut g, from, block, &mut written);
         }
     }
-    if !g.pins.iter().any(|&(p0, p1, _)| p0 < last && p1 > first) {
+    if all_clean
+        && g.holes.len() == holes_before
+        && !g.pins.iter().any(|&(p0, p1, _)| p0 < last && p1 > first)
+    {
         add_scanned(&mut g.scanned, first, last);
     }
     Some(written)
@@ -1562,5 +1569,51 @@ mod tests {
             )
         };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    #[test]
+    fn guard_with_unmapped_holes_does_not_cache_missing_blocks_as_scanned() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        // Reserve a 3-block span: map block 0 as a view, leave block 1..3 unmapped,
+        // wait: locate a free adjacent view of 1 block + 1 unmapped trailing block.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize;
+            (section, view)
+        };
+        assert_ne!(view, 0);
+        let _ = section;
+        title_memory_view(view, BLOCK, view, 0);
+        // First guard a 2-block range `[view, view + 2*BLOCK)` starting cleanly at `view`
+        // so `protect` hits `block 1` as a hole (`g.holes`), or when `check_each` sees unmapped holes:
+        let res = guard(view, view + 2 * BLOCK);
+        assert!(res.is_some());
+        {
+            let g = guards();
+            assert!(
+                !is_scanned(&g.scanned, view / BLOCK, view / BLOCK + 2),
+                "range with hole/unmapped block must not be marked fully scanned"
+            );
+        }
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            )
+        };
+        title_memory_remapped(view, 2 * BLOCK);
+        title_memory_view_gone(view, BLOCK);
     }
 }

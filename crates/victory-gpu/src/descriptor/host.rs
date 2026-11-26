@@ -2005,7 +2005,11 @@ impl HostHeap {
         // All of it is copied by the first submission of a frame only: the
         // later ones take what is new.
         if !remake && let Some(plan) = &b.plan {
-            if fresh.is_empty() && fresh_reads.is_empty() {
+            if fresh.is_empty()
+                && fresh_reads.is_empty()
+                && plan.fresh.is_empty()
+                && plan.fresh_reads.is_empty()
+            {
                 return Some(plan.clone());
             }
             let plan = Arc::new(BindlessPlan {
@@ -2024,10 +2028,20 @@ impl HostHeap {
         if !b.busy_dirty
             && !cfg!(test)
             && let Some(plan) = &b.plan
-            && plan.fresh.is_empty()
-            && plan.fresh_reads.is_empty()
         {
-            return Some(plan.clone());
+            // Allocate a fresh `BindlessPlan` with `copied_in = 0` so each new
+            // frame still copies constants even if another heap already updated `FRAME`.
+            let plan = Arc::new(BindlessPlan {
+                reads: plan.reads.clone(),
+                writes: plan.writes.clone(),
+                bounces: plan.bounces.clone(),
+                fresh,
+                fresh_reads,
+                copied_in: AtomicU64::new(0),
+                _retained: plan._retained.clone(),
+            });
+            b.plan = Some(plan.clone());
+            return Some(plan);
         }
         b.busy_dirty = false;
         let (mut reads, mut writes, mut bounces, mut retained) =
@@ -4357,5 +4371,38 @@ void main() {
 
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(title_heap), 0);
+    }
+
+    #[test]
+    fn bindless_plan_resets_copied_in_on_new_plan() {
+        let Some(_host) = host() else { return };
+        let (title_heap1, base1) = make_shader_heap(8);
+        let (title_heap2, base2) = make_shader_heap(8);
+        let mem = crate::resource::Memory::zeroed(256 << 10, 64 << 10).unwrap();
+        let cbv = |at: u64, slot_addr: u64| {
+            create_cbv(
+                std::ptr::null(),
+                &[at as u32, (at >> 32) as u32, 256, 0],
+                slot_addr,
+            );
+        };
+        cbv(mem.address(), base1);
+        cbv(mem.address() + 512, base2);
+        let h1 = heap(title_heap1).host_arc().unwrap();
+        let h2 = heap(title_heap2).host_arc().unwrap();
+        let p1 = h1.bindless_plan().unwrap();
+        let p2 = h2.bindless_plan().unwrap();
+        assert_eq!(p1.copied_in.load(Ordering::Relaxed), 0);
+        assert_eq!(p2.copied_in.load(Ordering::Relaxed), 0);
+        assert!(!p1.copy_constants().0.is_empty());
+        assert!(!p2.copy_constants().0.is_empty());
+        // Fresh call with changed slot still yields a fresh `copied_in == 0`.
+        cbv(mem.address() + 1024, base2 + 32);
+        let p2_next = h2.bindless_plan().unwrap();
+        assert_eq!(p2_next.copied_in.load(Ordering::Relaxed), 0);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(title_heap1), 0);
+        assert_eq!(release(title_heap2), 0);
     }
 }

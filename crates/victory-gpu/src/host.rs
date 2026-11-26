@@ -2898,6 +2898,7 @@ impl HostList {
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
         deferred.declared.clear();
+        deferred.gpu_written.clear();
     }
 
     /// Marks `(address, len)` as declared on this command list since the last
@@ -4344,8 +4345,7 @@ pub(crate) fn read_sparse_slice(src: *const u8, dst: &mut [u8]) {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, PAGE_WRITECOPY,
-        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let write = |at: usize, n: usize| {
@@ -4380,12 +4380,12 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
                 });
                 break;
             }
-            let writable = info.State == MEM_COMMIT
-                && matches!(
-                    info.Protect & 0xff,
-                    PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
-                );
-            if writable && !write(at as usize, n) {
+            // Do not exclude `PAGE_READONLY` here: guarded title views use
+            // `PAGE_READONLY` and rely on `try_user_copy` + VEH to open them.
+            let skip = info.State != MEM_COMMIT
+                || (info.Protect & 0xff) == PAGE_NOACCESS
+                || (info.Protect & PAGE_GUARD) != 0;
+            if !skip && !write(at as usize, n) {
                 for_pieces(at as usize, n, 4 << 10, |a, k| {
                     write(a, k);
                 });

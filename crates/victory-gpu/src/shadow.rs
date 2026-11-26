@@ -434,10 +434,13 @@ impl Shadow {
     }
 
     pub(crate) fn finish_card_pending(&self, declared: &[(usize, usize)]) {
+        let merged = Self::merge_back_ranges(declared);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        for &(address, len) in declared {
-            pending.retain(|&r| r != (address, address + len));
-        }
+        pending.retain(|&r| {
+            !merged
+                .iter()
+                .any(|&(a, l)| a <= r.0 && r.1 <= a.saturating_add(l))
+        });
     }
 
     #[cfg(test)]
@@ -835,7 +838,11 @@ impl Shadow {
         // Every submitted step that declared any of `ranges` is done with them
         // (one submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| !ranges.iter().any(|&(a, l)| r == (a, a.saturating_add(l))));
+        pending.retain(|&r| {
+            !merged
+                .iter()
+                .any(|&(a, l)| a <= r.0 && r.1 <= a.saturating_add(l))
+        });
         if pending.is_empty() {
             unchanged.clear();
             for (_, bytes) in snapshots.drain(..) {
@@ -2568,7 +2575,7 @@ impl Shadow {
         &self,
         s: &Sparse,
         merged: &[(usize, usize)],
-        ranges: &[(usize, usize)],
+        _ranges: &[(usize, usize)],
     ) -> usize {
         let mut views = Vec::new();
         for &(address, len) in merged {
@@ -2636,7 +2643,11 @@ impl Shadow {
             0
         };
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| !ranges.iter().any(|&(a, l)| r == (a, a.saturating_add(l))));
+        pending.retain(|&r| {
+            !merged
+                .iter()
+                .any(|&(a, l)| a <= r.0 && r.1 <= a.saturating_add(l))
+        });
         if pending.is_empty() {
             give_back_tiles(before.drain().map(|(_, buf)| buf));
         }
@@ -3399,5 +3410,83 @@ mod tests {
             assert_eq!(*((base + SIZE - PAGE) as *const u32), 0x5566_7788);
         }
         assert!(shadow.before.lock().unwrap().snapshots.is_empty());
+    }
+
+    #[test]
+    fn merged_writing_many_and_write_mapped_on_readonly_round_trip() {
+        let Some(host) = host() else { return };
+        const SIZE: usize = 256 << 10;
+        let title_mem = crate::resource::Memory::zeroed(SIZE as u64, 64 << 10).unwrap();
+        let (buf, data) = host.shared_buffer(SIZE as u64).unwrap();
+        // SAFETY: live resource.
+        let gpu = unsafe { buf.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buf, data, gpu, title_mem.address(), SIZE as u64, None);
+        shadow.watched.store(NOT_WATCHED, Ordering::Relaxed);
+
+        let base = title_mem.address() as usize;
+        // Simulate `HostList` coalescing two adjacent spans into `writing_many(&merged)`
+        // and later draining via unmerged `copy_back_many(&ranges)`.
+        let raw = [(base, PAGE), (base + PAGE, PAGE)];
+        let merged = Shadow::merge_back_ranges(&raw);
+        assert_eq!(merged, vec![(base, 2 * PAGE)]);
+        shadow.writing_many(&merged);
+        assert_eq!(shadow.pending.lock().unwrap().len(), 1);
+
+        // SAFETY: valid host/title buffers of `SIZE` bytes.
+        unsafe {
+            *(data as *mut u32) = 0xDEAD_BEEF;
+            *(data.add(PAGE) as *mut u32) = 0xCAFE_BABE;
+        }
+        let written = shadow.copy_back_many(&raw);
+        assert_eq!(written, 8);
+        assert!(shadow.pending.lock().unwrap().is_empty(), "merged pending span must drain");
+        assert!(shadow.before.lock().unwrap().snapshots.is_empty());
+
+        // `finish_card_pending` also clears merged `writing_many` entries.
+        shadow.writing_many(&merged);
+        shadow.finish_card_pending(&raw);
+        assert!(shadow.pending.lock().unwrap().is_empty(), "card pending span must drain");
+
+        // `write_mapped` >= 64 KiB must write through a `PAGE_READONLY` view block
+        // via `try_user_copy` + VEH (including through the `VirtualQuery` path).
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_FREE, MEMORY_BASIC_INFORMATION,
+            MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile, VirtualQuery,
+        };
+        // SAFETY: 1-block pagefile view cleaned up below.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                PAGE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE).Value as usize
+        };
+        assert_ne!(view, 0);
+        crate::watch::title_memory_view(view, PAGE, view, 0);
+        assert!(crate::watch::writes_guarded(view, view + PAGE).is_some());
+        let src = vec![0xA5u8; 2 * PAGE];
+        // SAFETY: queries virtual layout of our own process without dereferencing.
+        let mut next: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let has_hole = unsafe {
+            VirtualQuery((view + PAGE) as *const _, &mut next, size_of_val(&next))
+        } != 0
+            && next.State == MEM_FREE;
+        let write_len = if has_hole { 2 * PAGE } else { PAGE };
+        crate::host::write_mapped(view as *mut u8, src.as_ptr(), write_len);
+        // SAFETY: readable view memory.
+        assert_eq!(unsafe { *(view as *const u8) }, 0xA5);
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+        }
+        crate::watch::title_memory_remapped(view, PAGE);
+        crate::watch::title_memory_view_gone(view, PAGE);
     }
 }

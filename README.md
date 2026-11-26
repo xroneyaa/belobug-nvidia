@@ -22,7 +22,7 @@ intact.
 | Target adapters | NVIDIA RTX 3060 Ti 8 GB (Wave32 `32-32`, capped descriptor heap fallback); prior base also ran on AMD RX 9070 XT 16 GB (Wave64) |
 | Shader translation (Wave32 `32-32`) | **25,617 / 25,889** unique programs emit DXIL and pass `dxil.dll` validation across 26,503 containers in the shader archive (614 duplicates skipped; `14,247` VP, `2,676` CS, `8,694` MS; `272` unsupported: `195` non-VS/PS/CS/MS stages, `71` MS > 32 KiB, `6` multi-wave console wave64 CS), plus **40 / 44** across title binaries (`12` VP, `28` CS; `3` non-VS/PS/CS/MS, `1` console wave64 CS) |
 | Live in-game status (RTX 3060 Ti, prior runs) | Menus reached `29.9–30.8 fps` (`shadow::sweep` stalls eliminated); world runs reached `1+ fps`, with a deferred-lighting resolve shader dropped and stale `R9G9B9E5_SHAREDEXP` syncs causing yellow/black-sphere frames |
-| Live in-game status (after 2026-11-26 CPU frame & Wave32 shader pass) | **Ready for live re-test** (`victory-gpu`: `144 passed; 0 failed; 4 ignored`; `victory-shader`: `283 passed; 4 failed; 6 ignored`; `release` & `diag` built) |
+| Live in-game status (after 2026-11-26 CPU frame & Wave32 shader pass) | **Ready for live re-test** (`victory-gpu`: `147 passed; 0 failed; 4 ignored`; `victory-shader`: `283 passed; 4 failed; 6 ignored`; `release` & `diag` built) |
 | Ray tracing (`VICTORY_RAYS`) | Disabled by default; BVH builder/wind compute passes stay skipped unless opted in |
 
 ### What this fork changes
@@ -154,7 +154,7 @@ All checks below ran after the latest code edits with `--locked` on Windows 11 +
 
 - `cargo check --workspace --all-targets --locked`: **passed**
 - `cargo build --release --locked` and `cargo build --profile diag -p victory --features diagnostics --locked`: **passed**
-- `victory-gpu` (`-- --test-threads=1`): **`144 passed; 0 failed; 4 ignored`**; diagnostics `shadow::tests`: **`8 passed; 0 failed; 1 ignored`**
+- `victory-gpu` (`-- --test-threads=1`): **`147 passed; 0 failed; 4 ignored`**; diagnostics `shadow::tests`: **`9 passed; 0 failed; 1 ignored`**
 - `victory-shader` (`-- --test-threads=1`): **`283 passed; 4 failed; 6 ignored`** (all `ir::tests` and `emit::split_tests` pass including paired reused-lane unspilling and single-wave `console_cf` / `scc_bit` tests; same 4 pre-existing Wave32 `emit::valu_tests` failures listed below)
 - Other workspace test targets (`-- --test-threads=1`): `victory` (`1 passed`), `victory-core` (`11 passed`), `victory-formats` (`24 passed; 4 ignored`), `victory-game` (`2 passed`), `victory-loader` (`22 passed; 1 ignored` lib + `4` across `crash_log`, `load_probe`, and `title_dlls`), `victory-pe` (`7 passed`), `victory-pipeline` (`4 passed`)
 - `victory translate --validate --pipelines --host-lanes 32-32`: all **19** newly unblocked shaders (`1` PS, `18` CS) passed `dxil.dll` validation and D3D12 pipeline creation; full archive `--validate --host-lanes 32-32`: **`25,617`** validated across **`26,503`** containers (`614` duplicates skipped; `14,247` VP, `2,676` CS, `8,694` MS; `272` unsupported), plus **`40 / 44`** across title binaries (`12` VP, `28` CS)
