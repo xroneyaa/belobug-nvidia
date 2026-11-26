@@ -675,16 +675,109 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            // shortcut: not between textures without their largest mips.
-            if crate::resource::skipped_mips(dst) + crate::resource::skipped_mips(src) > 0 {
-                return;
-            }
             if crate::texture::title_written(from) {
                 crate::texture::upload(&list, src, from);
             }
             ensure_state(&list, dst, COPY_DEST);
             ensure_state(&list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
+            let (dst_skip, dst_title_mips) = crate::resource::mip_info(dst);
+            let (src_skip, src_title_mips) = crate::resource::mip_info(src);
+            if dst_skip > 0 || src_skip > 0 {
+                use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+                use windows::core::Interface;
+                // SAFETY: live D3D12 resources.
+                let (a, b) = unsafe { (to.GetDesc(), from.GetDesc()) };
+                if crate::resource::family(a.Format.0 as u32)
+                    != crate::resource::family(b.Format.0 as u32)
+                    || a.Dimension != b.Dimension
+                    || a.SampleDesc.Count != b.SampleDesc.Count
+                {
+                    return;
+                }
+                if a.Width == b.Width
+                    && a.Height == b.Height
+                    && a.MipLevels == b.MipLevels
+                    && a.DepthOrArraySize == b.DepthOrArraySize
+                {
+                    #[cfg(feature = "diagnostics")]
+                    list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+                    // SAFETY: an open list and live matching resources.
+                    unsafe { list.list.CopyResource(to, from) };
+                    return;
+                }
+                let is_3d = a.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+                let slices = if is_3d {
+                    1
+                } else {
+                    u32::from(a.DepthOrArraySize)
+                        .min(u32::from(b.DepthOrArraySize))
+                        .max(1)
+                };
+                let dst_host_mips = dst_title_mips.saturating_sub(dst_skip).max(1);
+                let src_host_mips = src_title_mips.saturating_sub(src_skip).max(1);
+                let start_mip = dst_skip.max(src_skip);
+                let end_mip = dst_title_mips.min(src_title_mips);
+                let to_raw = to.as_raw().cast_const().cast();
+                let from_raw = from.as_raw().cast_const().cast();
+                for slice in 0..slices {
+                    for guest_mip in start_mip..end_mip {
+                        let dst_mip = guest_mip - dst_skip;
+                        let src_mip = guest_mip - src_skip;
+                        if dst_mip >= dst_host_mips || src_mip >= src_host_mips {
+                            continue;
+                        }
+                        if (a.Width >> dst_mip).max(1) != (b.Width >> src_mip).max(1)
+                            || (u64::from(a.Height) >> dst_mip).max(1)
+                                != (u64::from(b.Height) >> src_mip).max(1)
+                            || (is_3d
+                                && (u32::from(a.DepthOrArraySize) >> dst_mip).max(1)
+                                    != (u32::from(b.DepthOrArraySize) >> src_mip).max(1))
+                        {
+                            continue;
+                        }
+                        let mut to_loc = CopyLocation {
+                            resource: to_raw,
+                            kind: 0,
+                            footprint: crate::resource::PlacedFootprint {
+                                offset: u64::from(slice * dst_host_mips + dst_mip),
+                                format: 0,
+                                width: 0,
+                                height: 0,
+                                depth: 0,
+                                row_pitch: 0,
+                            },
+                        };
+                        let mut from_loc = CopyLocation {
+                            resource: from_raw,
+                            kind: 0,
+                            footprint: crate::resource::PlacedFootprint {
+                                offset: u64::from(slice * src_host_mips + src_mip),
+                                format: 0,
+                                width: 0,
+                                height: 0,
+                                depth: 0,
+                                row_pitch: 0,
+                            },
+                        };
+                        let _ = (&mut to_loc, &mut from_loc);
+                        #[cfg(feature = "diagnostics")]
+                        list.note_op(|| format!("copy overlapping mip {guest_mip} ({src:?} -> {dst:?})"));
+                        // SAFETY: open list; both CopyLocations match D3D12_TEXTURE_COPY_LOCATION layout.
+                        unsafe {
+                            list.list.CopyTextureRegion(
+                                (&raw const to_loc).cast(),
+                                0,
+                                0,
+                                0,
+                                (&raw const from_loc).cast(),
+                                None,
+                            );
+                        }
+                    }
+                }
+                return;
+            }
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -750,6 +843,29 @@ fn readback_extent(
     (total != u64::MAX).then_some([fp.Width, fp.Height, fp.Depth])
 }
 
+/// Maps a guest subresource index to the host texture's subresource index when
+/// `skip` largest mips were dropped, returning `None` if that mip was omitted.
+#[cfg(windows)]
+fn remap_subresource_parts(skip: u32, title_mips: u32, guest_subresource: u32) -> Option<u32> {
+    if skip == 0 {
+        return Some(guest_subresource);
+    }
+    let title_mips = title_mips.max(1);
+    let mip = guest_subresource % title_mips;
+    if mip < skip {
+        return None;
+    }
+    let slice = guest_subresource / title_mips;
+    let host_mips = title_mips.saturating_sub(skip).max(1);
+    Some(slice * host_mips + (mip - skip))
+}
+
+#[cfg(windows)]
+fn remap_subresource(resource: This, guest_subresource: u32) -> Option<u32> {
+    let (skip, title_mips) = crate::resource::mip_info(resource);
+    remap_subresource_parts(skip, title_mips, guest_subresource)
+}
+
 /// Texture to texture on the GPU, buffer to texture through an upload
 /// buffer filled at submission, and texture to buffer through a readback
 /// buffer copied into title memory once the submission completes.
@@ -792,6 +908,10 @@ extern "system" fn copy_texture_region(
             ) else {
                 return;
             };
+            let Some(host_src_sub) = remap_subresource(src.resource, src.footprint.offset as u32)
+            else {
+                return;
+            };
             let Some((lines, row_bytes, total)) = dst.footprint.layout() else {
                 return;
             };
@@ -819,7 +939,7 @@ extern "system" fn copy_texture_region(
             let Some([width, height, depth]) = readback_extent(
                 host,
                 from_tex,
-                src.footprint.offset as u32,
+                host_src_sub,
                 // SAFETY: the optional source box is read during this call.
                 unsafe { source_box.as_ref() },
             ) else {
@@ -874,9 +994,6 @@ extern "system" fn copy_texture_region(
             let Some((buffer, staging)) = list.readback(host, staging_bytes) else {
                 return;
             };
-            if crate::resource::skipped_mips(src.resource) > 0 {
-                return;
-            }
             crate::texture::upload(&list, src.resource, from_tex);
             ensure_state(&list, src.resource, COPY_SOURCE);
             let mut to_location = dst;
@@ -886,6 +1003,7 @@ extern "system" fn copy_texture_region(
             to_location.footprint.row_pitch = host_pitch;
             let mut from_location = src;
             from_location.resource = from_tex.as_raw().cast_const().cast();
+            from_location.footprint.offset = u64::from(host_src_sub);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| {
                 // SAFETY: a live texture; the box is the title's or null.
@@ -933,6 +1051,10 @@ extern "system" fn copy_texture_region(
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             return;
         };
+        let Some(host_dst_sub) = remap_subresource(dst.resource, dst.footprint.offset as u32)
+        else {
+            return;
+        };
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -962,23 +1084,22 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
-            if crate::resource::skipped_mips(src.resource) > 0 {
+            let Some(host_src_sub) = remap_subresource(src.resource, src.footprint.offset as u32)
+            else {
                 return;
-            }
+            };
             if crate::texture::title_written(texture) {
                 crate::texture::upload(&list, src.resource, texture);
             }
             ensure_state(&list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
-        }
-        // shortcut: as in `copy_resource`.
-        if crate::resource::skipped_mips(dst.resource) > 0 {
-            return;
+            from.footprint.offset = u64::from(host_src_sub);
         }
         ensure_state(&list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
+        to_location.footprint.offset = u64::from(host_dst_sub);
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
@@ -2447,6 +2568,20 @@ void main() {
         for obj in [light_res, depth_res, title_heap] {
             assert_eq!(release(obj), 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remap_subresource_skips_dropped_mips_and_adjusts_slices() {
+        assert_eq!(super::remap_subresource_parts(0, 5, 3), Some(3));
+        assert_eq!(super::remap_subresource_parts(1, 5, 0), None);
+        assert_eq!(super::remap_subresource_parts(1, 5, 1), Some(0));
+        assert_eq!(super::remap_subresource_parts(1, 5, 4), Some(3));
+        // Slice 1 mip 0 is skipped; slice 1 mip 2 maps to slice 1 host mip 1 = 4 + 1 = 5.
+        assert_eq!(super::remap_subresource_parts(1, 5, 5), None);
+        assert_eq!(super::remap_subresource_parts(1, 5, 7), Some(5));
+        assert_eq!(super::remap_subresource_parts(2, 6, 1), None);
+        assert_eq!(super::remap_subresource_parts(2, 6, 8), Some(4));
     }
 
 }

@@ -1536,6 +1536,63 @@ fn auto_texture_max(dedicated_vram_mb: u64, used_percent: u64) -> u64 {
 /// its sides to pass `VICTORY_TEXTURE_MAX`: by default 1024, 512 and then 256 as
 /// video memory fills up (512/256 on 8 GB GPUs). All textures together did not
 /// fit, and paging them cost seconds a frame, or the driver failed.
+/// Auto mip drop for non-streamed pure sampled 2D textures on <= 8 GB GPUs
+/// (`VICTORY_TEXTURE_MIP_DROP`, defaulting to `1` when dedicated VRAM <= 8500 MiB).
+#[cfg(windows)]
+fn default_mip_drop(dedicated_vram_mb: u64) -> u32 {
+    u32::from(dedicated_vram_mb > 0 && dedicated_vram_mb <= 8500)
+}
+
+#[cfg(windows)]
+fn texture_mip_drop() -> u32 {
+    static DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DROP.get_or_init(|| {
+        if let Ok(val) = std::env::var("VICTORY_TEXTURE_MIP_DROP") {
+            return val.trim().parse::<u32>().unwrap_or(0).min(3);
+        }
+        let drop = default_mip_drop(crate::host::dedicated_vram_mb());
+        if drop > 0 {
+            tracing::info!(
+                mip_drop = drop,
+                vram_mb = crate::host::dedicated_vram_mb(),
+                "auto-enabling mip drop for <= 8 GB GPU"
+            );
+        }
+        drop
+    })
+}
+
+#[cfg(windows)]
+fn texture_mip_drop_explicit(d: &ResourceDesc, drop: u32, min_size: u64) -> u32 {
+    const TEXTURE2D: u32 = 3;
+    if drop == 0
+        || d.dimension != TEXTURE2D
+        || d.flags & 7 != 0
+        || d.sample_count > 1
+        || !d.width.is_power_of_two()
+        || !u64::from(d.height).is_power_of_two()
+        || d.width < min_size
+        || u64::from(d.height) < min_size
+    {
+        return 0;
+    }
+    let block = element(pc_format(d.format)).map_or(1, |(_, b)| b);
+    let mut k = drop;
+    while k > 0 {
+        let w = d.width >> k;
+        let h = u64::from(d.height) >> k;
+        if u32::from(d.mip_levels) > k + 1
+            && w > 0
+            && h > 0
+            && (block <= 1 || (w.is_multiple_of(block) && h.is_multiple_of(block)))
+        {
+            return k;
+        }
+        k -= 1;
+    }
+    0
+}
+
 #[cfg(windows)]
 fn over_cap(d: &ResourceDesc, streamed: bool) -> u32 {
     static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1544,16 +1601,26 @@ fn over_cap(d: &ResourceDesc, streamed: bool) -> u32 {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
     });
-    if !streamed || textures() != Textures::Stream {
+    if cfg!(test) || textures() != Textures::Stream {
         return 0;
+    }
+    if !streamed {
+        static MIN_SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let min_size = *MIN_SIZE.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(1024)
+        });
+        return texture_mip_drop_explicit(d, texture_mip_drop(), min_size);
     }
     let max = set.unwrap_or_else(|| {
         auto_texture_max(crate::host::dedicated_vram_mb(), video_memory_percent())
     });
     const TEXTURE2D: u32 = 3;
     let block = (70..=84).contains(&d.format) || (94..=99).contains(&d.format);
-    if cfg!(test)
-        || max == 0
+    if max == 0
         || d.dimension != TEXTURE2D
         || d.flags & 7 != 0
         || !block
@@ -1581,6 +1648,20 @@ pub(crate) fn skipped_mips(this: This) -> u32 {
         return 0;
     }
     resource(this).ensure_host().map_or(0, |h| h.skip)
+}
+
+/// `(skipped_mips, title_mip_levels)` for texture `this`.
+#[cfg(windows)]
+pub(crate) fn mip_info(this: This) -> (u32, u32) {
+    if this.is_null() {
+        return (0, 1);
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return (0, 1);
+    }
+    let skip = r.ensure_host().map_or(0, |h| h.skip);
+    (skip, u32::from(r.desc.mip_levels).max(1))
 }
 
 /// A host texture like the title's: same description, in GPU memory,
@@ -3600,5 +3681,59 @@ mod tests {
         // Once frame reaches 14, `placed_budget_allows()` is true in tests so backoff resets.
         assert!(super::try_evict_budget_with_backoff(14, &next, u64::MAX));
         assert_eq!(next.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn auto_mip_drop_respects_vram_and_texture_eligibility() {
+        assert_eq!(super::default_mip_drop(0), 0);
+        assert_eq!(super::default_mip_drop(8192), 1);
+        assert_eq!(super::default_mip_drop(8500), 1);
+        assert_eq!(super::default_mip_drop(12288), 0);
+
+        let desc = super::ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 1024,
+            height: 1024,
+            depth_or_array_size: 1,
+            mip_levels: 11,
+            format: 98, // BC7_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+        assert_eq!(super::texture_mip_drop_explicit(&desc, 1, 1024), 1);
+        assert_eq!(super::texture_mip_drop_explicit(&desc, 2, 1024), 2);
+        assert_eq!(super::texture_mip_drop_explicit(&desc, 0, 1024), 0);
+
+        // Render target / depth / UAV flags must never drop mips.
+        let rt = super::ResourceDesc { flags: 1, ..desc };
+        assert_eq!(super::texture_mip_drop_explicit(&rt, 1, 1024), 0);
+
+        // Non-power-of-two, too-small, or single-mip textures stay untouched.
+        let npot = super::ResourceDesc { width: 1000, ..desc };
+        assert_eq!(super::texture_mip_drop_explicit(&npot, 1, 1024), 0);
+        let small = super::ResourceDesc {
+            width: 512,
+            height: 512,
+            ..desc
+        };
+        assert_eq!(super::texture_mip_drop_explicit(&small, 1, 1024), 0);
+        let single_mip = super::ResourceDesc {
+            mip_levels: 1,
+            ..desc
+        };
+        assert_eq!(super::texture_mip_drop_explicit(&single_mip, 1, 1024), 0);
+
+        // BC 4x4 block alignment prevents dropping down below block size.
+        let bc_tiny = super::ResourceDesc {
+            width: 4,
+            height: 4,
+            mip_levels: 3,
+            ..desc
+        };
+        assert_eq!(super::texture_mip_drop_explicit(&bc_tiny, 1, 4), 0);
     }
 }

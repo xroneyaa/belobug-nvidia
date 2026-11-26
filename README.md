@@ -21,8 +21,8 @@ intact.
 |------|---------------|
 | Target adapters | NVIDIA RTX 3060 Ti 8 GB (Wave32 `32-32`, capped descriptor heap fallback); prior base also ran on AMD RX 9070 XT 16 GB (Wave64) |
 | Shader translation (Wave32 `32-32`) | **25,491 / 25,889** programs emit DXIL across 26,503 containers in the shader archive (614 duplicates skipped; 398 unsupported, see below) |
-| Live in-game status (RTX 3060 Ti, before Stage 2 CPU/freeze pass) | World frames rendered at `0.1–1.3 fps` (`1.6–7.3 s/frame`) with menu/loading stalls (`347–728 ms` `shadow::sweep` freezes, `1.5–1.6 s` `bindless_plan` urgent bursts, and thread/memory contention) |
-| Live in-game status (after 2026-11-26 Stage 2 FPS/freeze pass) | **Ready for live re-test** via `target\release\victory.exe` / `target\diag\victory.exe` (`victory-gpu`: `137 passed; 0 failed; 4 ignored`) |
+| Live in-game status (RTX 3060 Ti, prior runs) | Menus reached `29.9–30.8 fps` (`shadow::sweep` stalls eliminated); world scenes ran `0.2–1.0 fps` before hitting a Windows commit `Os { code: 1455 }` thread-spawn crash (`5.1 GiB` textures + `2.3 GiB` sparse tile heaps, `1.5–2.8 s` `bindless_plan` / sparse copy loops) |
+| Live in-game status (after 2026-11-26 Stage 2b commit/FPS pass) | **Ready for live re-test** (`victory-gpu`: `140 passed; 0 failed; 4 ignored`) |
 | Ray tracing (`VICTORY_RAYS`) | Disabled by default; BVH builder/wind compute passes stay skipped unless opted in |
 
 ### What this fork changes
@@ -60,31 +60,42 @@ intact.
   uses a D3D12 buffer-bridge copy fallback for `R9G9B9E5_SHAREDEXP` (DXGI
   format `42`) via shared `HostHeap::placed_raw_texture` across both bindless
   (`resolve_placed`) and root-table (`use_slot`) descriptor paths; flushes
-  dirty shared-exponent copies at the end of `HostContext::bind`; enforces the
-  per-frame plan budget (capping exhausted-budget urgent bursts to `<= 32`
-  slots / `1 ms` per submission and deferring full stale-view scans when budget
-  is zero instead of burning `40 ms` per submission); and keeps small draw
+  dirty shared-exponent copies at the end of `HostContext::bind`; keys
+  `Bindless::budget` to each presented frame (`presented() + 1`) so slow
+  frames do not refill the plan budget mid-frame; checks elapsed time per slot
+  and caps exhausted-budget urgent overflow (`URGENT_OVERFLOW_FRAME_US = 4_000`
+  via `HostHeap::urgent_overflow_left` / `spend_urgent_overflow`), deferring
+  full stale-view scans when budget is zero; and keeps small draw
   root-constant assembly on the stack in `draw.rs`.
-- **8 GB placed texture budget, eviction backoff & bounded sparse sweeps (`resource.rs`, `texture.rs`, `shadow.rs`)**:
+- **8 GB placed + non-streamed texture budget, eviction backoff & bounded sparse sweeps (`resource.rs`, `list.rs`, `texture.rs`, `shadow.rs`)**:
   tracks active cached placed textures in `PLACED_CACHE_BYTES` and evicts idle
   placed textures by `HostTexture::used` (`evict_idle_placed_to`) with a
   4-frame CAS backoff (`try_evict_budget_with_backoff`) when active textures
-  fill the budget; replaces exception-faulting per-64-KiB probes in `committed`
-  with batched `K32QueryWorkingSetEx` checks (`committed_blocks`); skips both
-  unmapped and committed region extents via `region_state` in `shadow::sweep`
-  with rotating shadow cursors and a `4 ms` per-sweep time cap (eliminating
-  `347–728 ms` menu freezes under `VICTORY_SWEEP_TILES=2`); and parallelizes
-  texture staging refreshes in `Early::take` and `HostList::run_deferred`.
-- **Parallel copy/copy-back & disjoint UAV snapshots (`host.rs`, `shadow.rs`, `card.rs`)**:
-  stores disjoint UAV `Before::snapshots` segments (coalesced only within a
-  `256 KiB` gap) with parallel `copy_host_bytes` (`>= 512 KiB`) instead of
-  single-threaded whole-heap gap copies in `Shadow::writing`; parallelizes
-  `Shadow::copy_back_many` page comparisons across cores and coalesces contiguous
-  `watch::writes` syncs even when a submission targets a single shared heap;
-  guards `in_parallel` recursion and skips thread-pool spawn for small batches
-  (`< 256 KiB`); reports wall-clock (not thread-summed) `PREPARING` copy times
-  and avoids double-counting `Batch::title_written` inside `Step::Copy`; and
-  batches `s.looks` locking + parallel `copy_tiles` / `card::finish_back`.
+  fill the budget; enables automatic `1`-mip drop on `<= 8500 MiB` VRAM GPUs
+  for eligible non-streamed pure sampled 2D power-of-two textures `>= 1024 px`
+  (`VICTORY_TEXTURE_MIP_DROP`, `default_mip_drop`) with overlapping subresource
+  copy and readback remapping in `list.rs` (`copy_resource`,
+  `copy_texture_region`, `remap_subresource`); replaces exception-faulting
+  per-64-KiB probes in `committed` with batched `K32QueryWorkingSetEx` checks
+  (`committed_blocks`); caches both unmapped and committed region extents via
+  `region_state` in `shadow::copy_tiles_range` (counting only changed bytes)
+  and `shadow::sweep` with rotating shadow cursors and a `4 ms` per-sweep time
+  cap (eliminating `347–728 ms` menu freezes under `VICTORY_SWEEP_TILES=2`);
+  and parallelizes texture staging refreshes in `Early::take` and
+  `HostList::run_deferred`.
+- **Persistent worker pool, parallel copy/copy-back & disjoint UAV snapshots (`host.rs`, `shadow.rs`, `card.rs`)**:
+  replaces per-call `std::thread::scope` thread spawns inside `host::in_parallel`
+  with a persistent worker pool (`POOL: OnceLock<Pool>`) and inline
+  spawn-failure fallback (preventing `Os { code: 1455 }` panics under high
+  Windows commit); stores disjoint UAV `Before::snapshots` segments (coalesced
+  only within a `256 KiB` gap) with parallel `copy_host_bytes` (`>= 512 KiB`)
+  instead of single-threaded whole-heap gap copies in `Shadow::writing`;
+  parallelizes `Shadow::copy_back_many`, `sparse_back_many`, and
+  `merge_card_pieces` lock-free across cores and coalesces contiguous
+  `PAGE`-gap `watch::writing` syncs afterward; reports wall-clock (not
+  thread-summed) `PREPARING` copy times and avoids double-counting
+  `Batch::title_written` inside `Step::Copy`; and batches `s.looks` locking +
+  parallel `copy_tiles` / `card::finish_back`.
 - **Coalesced `GetWriteWatch` & view-guard coherence (`watch.rs`, `shadow.rs`, `host.rs`, `texture.rs`)**:
   adds `ask_once` (`VICTORY_ASK_ONCE=0` disables) across submission
   refreshes plus `ask_ahead` batching for `Batch::flush` and `prepare_bindless`
@@ -111,7 +122,7 @@ All checks below ran with `--locked` on Windows 11 + RTX 3060 Ti (`host waves 32
 
 - `cargo check --workspace --all-targets --locked`: **passed**
 - `cargo build --release --locked` and `cargo build --profile diag -p victory --features diagnostics --locked`: **passed**
-- `victory-gpu` (`-- --test-threads=1`, run after the latest edits): **`137 passed; 0 failed; 4 ignored`**
+- `victory-gpu` (`-- --test-threads=1`, run after the latest edits): **`140 passed; 0 failed; 4 ignored`**
 - Other unchanged passing crates (last run prior to the `victory-gpu` CPU/FPS pass):
   `victory` (`1 passed`), `victory-core` (`11 passed`), `victory-formats`
   (`24 passed; 4 ignored`), `victory-game` (`2 passed`), `victory-pe`

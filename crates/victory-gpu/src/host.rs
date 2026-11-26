@@ -3461,44 +3461,178 @@ impl Early {
     }
 }
 
-/// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
-/// Nested calls inside an already-parallel worker execute inline so thread
-/// pools never oversubscribe recursively.
+/// Runs `f` on pieces of `list`, of `least` items or more, on a persistent worker
+/// pool. Nested calls inside an already-parallel worker execute inline so pool
+/// threads never deadlock, and startup spawn failures fall back cleanly inline
+/// without panicking.
 pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + Sync) {
-    const THREADS: usize = 6;
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
     thread_local! {
         static ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
     if list.len() <= least || ACTIVE.with(|a| a.get()) {
         return f(list);
     }
-    // Small pieces, taken in turn: they are not equally long to do.
-    let piece = (list.len() / (THREADS * 8)).max(least);
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let work = || {
-        struct Reset;
-        impl Drop for Reset {
+
+    struct ActiveReset;
+    impl Drop for ActiveReset {
+        fn drop(&mut self) {
+            ACTIVE.with(|a| a.set(false));
+        }
+    }
+
+    struct Ticket {
+        fn_ptr: usize,
+        list_ptr: usize,
+        list_len: usize,
+        piece: usize,
+        next: AtomicUsize,
+        remaining: AtomicUsize,
+        done_lock: Mutex<bool>,
+        done_cv: Condvar,
+        call: unsafe fn(usize, usize, usize, usize),
+    }
+
+    unsafe fn run_ticket(ticket_addr: usize) {
+        // SAFETY: `WaitGuard` keeps `Ticket` alive on the caller's stack until
+        // every dispatched worker runs `DoneGuard::drop` and signals `done_cv`.
+        let ticket = unsafe { &*(ticket_addr as *const Ticket) };
+        struct DoneGuard<'a>(&'a Ticket);
+        impl Drop for DoneGuard<'_> {
             fn drop(&mut self) {
-                ACTIVE.with(|a| a.set(false));
+                if self.0.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    let mut done = self.0.done_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    *done = true;
+                    self.0.done_cv.notify_all();
+                }
             }
         }
+        let _done = DoneGuard(ticket);
         ACTIVE.with(|a| a.set(true));
-        let _reset = Reset;
+        let _active = ActiveReset;
         loop {
-            let from = next.fetch_add(piece, Ordering::Relaxed);
-            if from >= list.len() {
+            let from = ticket.next.fetch_add(ticket.piece, Ordering::Relaxed);
+            if from >= ticket.list_len {
                 break;
             }
-            f(&list[from..(from + piece).min(list.len())]);
+            let to = (from + ticket.piece).min(ticket.list_len);
+            // SAFETY: `[from, to)` is within `list` and `fn_ptr` points to live `f`.
+            unsafe { (ticket.call)(ticket.fn_ptr, ticket.list_ptr, from, to) };
         }
-    };
-    let threads = THREADS.min(list.len().div_ceil(piece));
-    std::thread::scope(|s| {
-        for _ in 1..threads {
-            s.spawn(work);
+    }
+
+    struct Shared {
+        queue: Mutex<VecDeque<usize>>,
+        wake: Condvar,
+    }
+    struct Pool {
+        shared: Arc<Shared>,
+        workers: usize,
+    }
+
+    static POOL: OnceLock<Pool> = OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        let wanted = std::thread::available_parallelism()
+            .map_or(3, |n| (n.get() / 2).clamp(2, 6).saturating_sub(1));
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(VecDeque::new()),
+            wake: Condvar::new(),
+        });
+        let mut workers = 0usize;
+        for i in 0..wanted {
+            let s = shared.clone();
+            if std::thread::Builder::new()
+                .name(format!("victory-par-{i}"))
+                .spawn(move || loop {
+                    let ticket = {
+                        let mut q = s.queue.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if let Some(t) = q.pop_front() {
+                                break t;
+                            }
+                            q = s.wake.wait(q).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    // SAFETY: `ticket` stays alive until `DoneGuard` finishes it.
+                    unsafe { run_ticket(ticket) };
+                })
+                .is_ok()
+            {
+                workers += 1;
+            }
         }
-        work();
+        Pool { shared, workers }
     });
+
+    let total_threads = pool.workers + 1;
+    let piece = (list.len() / (total_threads * 8)).max(least);
+    let total_pieces = list.len().div_ceil(piece);
+    if pool.workers == 0 || total_pieces <= 1 {
+        ACTIVE.with(|a| a.set(true));
+        let _active = ActiveReset;
+        return f(list);
+    }
+
+    let dispatch = pool.workers.min(total_pieces - 1);
+    unsafe fn call<T: Sync, F: Fn(&[T]) + Sync>(
+        fn_ptr: usize,
+        list_ptr: usize,
+        from: usize,
+        to: usize,
+    ) {
+        // SAFETY: caller's stack holds live `&F` and `&[T]` for the duration of `WaitGuard`.
+        let func = unsafe { &*(fn_ptr as *const F) };
+        let slice = unsafe { std::slice::from_raw_parts((list_ptr as *const T).add(from), to - from) };
+        func(slice);
+    }
+    fn call_fn<T: Sync, F: Fn(&[T]) + Sync>(_: &F) -> unsafe fn(usize, usize, usize, usize) {
+        call::<T, F>
+    }
+
+    let ticket = Ticket {
+        fn_ptr: (&raw const f) as usize,
+        list_ptr: list.as_ptr() as usize,
+        list_len: list.len(),
+        piece,
+        next: AtomicUsize::new(0),
+        remaining: AtomicUsize::new(dispatch),
+        done_lock: Mutex::new(false),
+        done_cv: Condvar::new(),
+        call: call_fn::<T, _>(&f),
+    };
+    struct WaitGuard<'a>(&'a Ticket);
+    impl Drop for WaitGuard<'_> {
+        fn drop(&mut self) {
+            let mut done = self.0.done_lock.lock().unwrap_or_else(|e| e.into_inner());
+            while !*done {
+                done = self.0.done_cv.wait(done).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+    }
+
+    let ticket_addr = (&raw const ticket) as usize;
+    {
+        let mut q = pool.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..dispatch {
+            q.push_back(ticket_addr);
+        }
+    }
+    let _wait = WaitGuard(&ticket);
+    pool.shared.wake.notify_all();
+    ACTIVE.with(|a| a.set(true));
+    let _active = ActiveReset;
+    loop {
+        let from = ticket.next.fetch_add(ticket.piece, Ordering::Relaxed);
+        if from >= ticket.list_len {
+            break;
+        }
+        let to = (from + ticket.piece).min(ticket.list_len);
+        // SAFETY: `[from, to)` lies inside `list`.
+        unsafe { (ticket.call)(ticket.fn_ptr, ticket.list_ptr, from, to) };
+    }
 }
 
 /// Brings `[from, from + len)` of a host copy up to date now.
@@ -4835,6 +4969,29 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
         // SAFETY: our reservation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn in_parallel_pool_handles_work_and_nested_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let items: Vec<(usize, AtomicUsize)> =
+            (0..64).map(|i| (i, AtomicUsize::new(0))).collect();
+        super::in_parallel(&items, 4, |slice| {
+            for (idx, cell) in slice {
+                cell.fetch_add(*idx + 1, Ordering::Relaxed);
+            }
+            // A nested call on either the caller or a pool worker must run inline
+            // without deadlocking the shared worker pool.
+            super::in_parallel(slice, 1, |inner| {
+                for (_, cell) in inner {
+                    cell.fetch_add(10, Ordering::Relaxed);
+                }
+            });
+        });
+        for (i, (idx, cell)) in items.iter().enumerate() {
+            assert_eq!(*idx, i);
+            assert_eq!(cell.load(Ordering::Relaxed), i + 11);
+        }
     }
 }
 

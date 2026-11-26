@@ -196,9 +196,10 @@ struct Bindless {
     recheck: VecDeque<(u64, usize)>,
     /// A frame and the uploads of known textures done in it.
     rechecks: (u64, u32),
-    /// When the slot-making budget was last refilled, and the microseconds
-    /// left: plans at submission, placed textures at recording.
-    budget: Option<(std::time::Instant, [u64; 2])>,
+    /// `(presented_frame + 1, last_refill, [plan_us, record_us], urgent_overflow_us)`.
+    /// Refilled at most once per presented frame so slow frames cannot trigger
+    /// repeated 20 ms budget refills mid-frame.
+    budget: Option<(u64, std::time::Instant, [u64; 2], u64)>,
     /// The frame (plus one) released views and evicted textures were last
     /// looked for in: at submission, at recording. Once per frame: the title
     /// releases and evicts all the time, and each look is over all slots.
@@ -219,26 +220,46 @@ struct Bindless {
 /// streaming pops in; making all of them at once stalled frames for
 /// seconds.
 const SLOT_BUDGET_US: u64 = 20_000;
+/// Total per-frame emergency budget allowed across all zero-budget submissions.
+const URGENT_OVERFLOW_FRAME_US: u64 = 4_000;
 /// Slots taken to make at once (the rest wait without being looked at).
 const SLOT_CHUNK: usize = 512;
 /// Urgent slots favored each submission before yielding to `SLOT_BUDGET_US`.
 const URGENT: usize = 256;
 
 impl Bindless {
-    /// The slot-making budget, refilled for the time passed since.
-    fn budget(&mut self) -> &mut [u64; 2] {
+    fn ensure_budget(&mut self) -> &mut (u64, std::time::Instant, [u64; 2], u64) {
         let now = std::time::Instant::now();
-        let (at, left) = self
+        let frame = crate::queue::presented() + 1;
+        let entry = self
             .budget
-            .get_or_insert((now, [SLOT_BUDGET_US; 2]));
-        let add = now.duration_since(*at).as_micros() as u64 / 8;
-        if add > 0 {
-            *at = now;
-            for l in left.iter_mut() {
-                *l = (*l + add).min(SLOT_BUDGET_US);
+            .get_or_insert((frame, now, [SLOT_BUDGET_US; 2], URGENT_OVERFLOW_FRAME_US));
+        if frame != entry.0 {
+            let add = now.duration_since(entry.1).as_micros() as u64 / 8;
+            entry.0 = frame;
+            entry.1 = now;
+            if add > 0 {
+                for l in entry.2.iter_mut() {
+                    *l = (*l + add).min(SLOT_BUDGET_US);
+                }
             }
+            entry.3 = URGENT_OVERFLOW_FRAME_US;
         }
-        left
+        entry
+    }
+
+    /// The slot-making budget, refilled at most once per presented frame.
+    fn budget(&mut self) -> &mut [u64; 2] {
+        &mut self.ensure_budget().2
+    }
+
+    fn urgent_overflow_left(&mut self) -> u64 {
+        self.ensure_budget().3
+    }
+
+    fn spend_urgent_overflow(&mut self, us: u64) {
+        let left = &mut self.ensure_budget().3;
+        *left = left.saturating_sub(us);
     }
 }
 
@@ -820,6 +841,20 @@ impl HostHeap {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         let left = &mut b.budget()[which];
         *left = left.saturating_sub(us);
+    }
+
+    fn urgent_overflow_left(&self) -> u64 {
+        self.bindless
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .urgent_overflow_left()
+    }
+
+    fn spend_urgent_overflow(&self, us: u64) {
+        self.bindless
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spend_urgent_overflow(us);
     }
 
     /// `n` consecutive free dynamic slots (view heaps and capped sampler
@@ -1810,7 +1845,11 @@ impl HostHeap {
             }
         }
         todo.extend(stale_views(&check).into_iter().map(|(i, v)| (i, Some(v))));
-        let (started, left) = (std::time::Instant::now(), self.budget_left(0));
+        let (started, left, urgent_cap) = (
+            std::time::Instant::now(),
+            self.budget_left(0),
+            self.urgent_overflow_left(),
+        );
         let mut made_any = false;
         let mut fresh = Vec::new();
         let mut fresh_reads = Vec::new();
@@ -1820,22 +1859,20 @@ impl HostHeap {
         let mut todo = todo.into_iter();
         let mut count = 0usize;
         for (index, entry) in todo.by_ref() {
-            if left == 0 && count >= exempt {
+            if left == 0 && (count >= exempt || urgent_cap == 0) {
                 over = Some(index);
                 break;
             }
             let cap = if left == 0 {
-                // Frame budget is spent: cap emergency newly-written slots to
-                // at most ~1 ms per submission instead of 40 ms.
-                1_000
+                urgent_cap
             } else if count < exempt {
                 left.saturating_mul(2)
             } else {
                 left
             };
-            let check_clock = left == 0 || (count & 15) == 0 || count == exempt;
-            if check_clock && count > 0 && started.elapsed().as_micros() as u64 > cap {
-                // Over budget: the rest waits for the next submission.
+            if count > 0 && started.elapsed().as_micros() as u64 > cap {
+                // Check elapsed time after every slot so slow placed textures cannot
+                // stack 16 unguarded iterations into multi-second stalls.
                 over = Some(index);
                 break;
             }
@@ -1844,7 +1881,12 @@ impl HostHeap {
             let made = entry.map(|e| (e, self.use_slot(index, e)));
             results.push((index, made));
         }
-        self.budget_spend(0, started.elapsed().as_micros() as u64);
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        if left == 0 {
+            self.spend_urgent_overflow(elapsed_us);
+        } else {
+            self.budget_spend(0, elapsed_us);
+        }
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         for (index, made) in results {
             match made {

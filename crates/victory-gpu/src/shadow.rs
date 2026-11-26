@@ -360,15 +360,18 @@ impl Shadow {
         if work.is_empty() {
             return 0;
         }
-        let written = std::sync::atomic::AtomicUsize::new(0);
-        let merged_sync: std::sync::Mutex<(Vec<usize>, Vec<(usize, usize)>, usize, usize)> =
-            std::sync::Mutex::new((Vec::new(), Vec::new(), usize::MAX, 0));
+        let merged_sync: std::sync::Mutex<(
+            Vec<usize>,
+            Vec<(usize, usize)>,
+            Vec<(usize, Vec<u8>, usize, usize)>,
+            usize,
+            usize,
+        )> = std::sync::Mutex::new((Vec::new(), Vec::new(), Vec::new(), usize::MAX, 0));
         crate::host::in_parallel(&work, 4, |chunk| {
-            let mut title_buf = pooled(PAGE);
-            title_buf.resize(PAGE, 0);
-            let mut local_written = 0usize;
+            let mut title_scratch: Option<Vec<u8>> = None;
             let mut local_pages = Vec::new();
             let mut local_dirty = Vec::new();
+            let mut local_writes: Vec<(usize, Vec<u8>, usize, usize)> = Vec::new();
             let mut local_min = usize::MAX;
             let mut local_max = 0usize;
             for &(off, rb_slice_ptr) in chunk {
@@ -383,24 +386,21 @@ impl Shadow {
                 if gpu_new == staging_old {
                     continue;
                 }
-                let title_slice = &mut title_buf[..n];
-                if !crate::host::read_into(title_addr as *const u8, title_slice) {
+                let mut title_buf = title_scratch.take().unwrap_or_else(|| pooled(PAGE));
+                if title_buf.len() < PAGE {
+                    title_buf.resize(PAGE, 0);
+                }
+                if !crate::host::read_into(title_addr as *const u8, &mut title_buf[..n]) {
                     staging_old.copy_from_slice(gpu_new);
+                    title_scratch = Some(title_buf);
                     continue;
                 }
                 let (dirty_span, cpu_modified) =
-                    merge_gpu_writes_card(title_slice, staging_old, gpu_new);
+                    merge_gpu_writes_card(&mut title_buf[..n], staging_old, gpu_new);
                 if let Some((dirty_start, dirty_end)) = dirty_span {
-                    let dirty_len = dirty_end - dirty_start;
-                    if mode != 1 {
-                        crate::watch::writing(title_addr + dirty_start, dirty_len);
-                    }
-                    crate::host::write_mapped(
-                        (title_addr + dirty_start) as *mut u8,
-                        title_slice[dirty_start..].as_ptr(),
-                        dirty_len,
-                    );
-                    local_written += dirty_len;
+                    local_writes.push((title_addr + dirty_start, title_buf, dirty_start, dirty_end));
+                } else {
+                    title_scratch = Some(title_buf);
                 }
                 if cpu_modified {
                     local_dirty.push((off, off + n));
@@ -413,23 +413,56 @@ impl Shadow {
                 local_min = local_min.min(title_addr);
                 local_max = local_max.max(title_addr + n);
             }
-            give_back(title_buf);
-            if local_written > 0 {
-                written.fetch_add(local_written, Ordering::Relaxed);
+            if let Some(buf) = title_scratch {
+                give_back(buf);
             }
-            if !local_pages.is_empty() || !local_dirty.is_empty() {
+            if !local_pages.is_empty() || !local_dirty.is_empty() || !local_writes.is_empty() {
                 let mut g = merged_sync.lock().unwrap_or_else(|e| e.into_inner());
                 g.0.extend(local_pages);
                 g.1.extend(local_dirty);
-                g.2 = g.2.min(local_min);
-                g.3 = g.3.max(local_max);
+                g.2.extend(local_writes);
+                g.3 = g.3.min(local_min);
+                g.4 = g.4.max(local_max);
             }
         });
-        let (synced_pages, dirty_up, min_addr, max_addr) = merged_sync.into_inner().unwrap();
+        let (synced_pages, dirty_up, mut dirty_writes, min_addr, max_addr) =
+            merged_sync.into_inner().unwrap();
         for (lo, hi) in dirty_up {
             card.mark_dirty(lo, hi);
         }
-        let written = written.into_inner();
+        let mut written = 0usize;
+        if !dirty_writes.is_empty() {
+            dirty_writes.sort_unstable_by_key(|w| w.0);
+            if mode != 1 {
+                let mut span: Option<(usize, usize)> = None;
+                for &(addr, _, dirty_start, dirty_end) in &dirty_writes {
+                    let end = addr + (dirty_end - dirty_start);
+                    match &mut span {
+                        Some((_, e)) if addr <= e.saturating_add(PAGE) => {
+                            *e = (*e).max(end);
+                        }
+                        Some((s, e)) => {
+                            crate::watch::writing(*s, *e - *s);
+                            span = Some((addr, end));
+                        }
+                        None => span = Some((addr, end)),
+                    }
+                }
+                if let Some((s, e)) = span {
+                    crate::watch::writing(s, e - s);
+                }
+            }
+            for (addr, buf, dirty_start, dirty_end) in dirty_writes {
+                let dirty_len = dirty_end - dirty_start;
+                crate::host::write_mapped(
+                    addr as *mut u8,
+                    buf[dirty_start..].as_ptr(),
+                    dirty_len,
+                );
+                written += dirty_len;
+                give_back(buf);
+            }
+        }
 
         if !synced_pages.is_empty() && mode != NOT_WATCHED && min_addr < max_addr {
             let (first, last) = (min_addr.div_ceil(PAGE), max_addr / PAGE);
@@ -1077,12 +1110,10 @@ impl Shadow {
                 .collect()
         };
         let mut bytes = 0;
-        // The title's unmapped memory found last: tiles of it have no memory
-        // here either (reads give zeros). Tens of thousands of tiles a frame
-        // were zeros copied, 1.4 GB of them.
+        // Cache both contiguous unmapped (`hole`) and committed (`alive`) ranges
+        // so committed sparse pools skip per-tile `VirtualQuery` syscalls too.
         let mut hole = 0..0;
-        let mut idx = 0usize;
-        let _ = &mut idx;
+        let mut alive = 0..0;
         let mut at = from;
         while at < to {
             let n = (PAGE - (at - start) % PAGE).min(to - at);
@@ -1097,11 +1128,17 @@ impl Shadow {
                 at = next;
                 continue;
             }
-            if !(hole.contains(&whole.start) && whole.end <= hole.end) {
-                hole = match unmapped(whole.start) {
-                    Some(end) => whole.start..end,
-                    None => 0..0,
-                };
+            if !(hole.contains(&whole.start) && whole.end <= hole.end)
+                && !(alive.contains(&whole.start) && whole.end <= alive.end)
+            {
+                let (gone, end) = region_state(whole.start);
+                if gone {
+                    hole = whole.start..end;
+                    alive = 0..0;
+                } else {
+                    alive = whole.start..end;
+                    hole = 0..0;
+                }
             }
             if whole.start >= hole.start && whole.end <= hole.end {
                 if !look.hole {
@@ -1125,7 +1162,6 @@ impl Shadow {
                 continue;
             };
             let data = (data + at % PAGE) as *mut u8;
-            bytes += n;
             let mut same = true;
             READ.with_borrow_mut(|read| {
                 if !crate::host::read_into(at as *const u8, &mut read[..n]) {
@@ -1148,6 +1184,7 @@ impl Shadow {
                     };
                     if changed {
                         same = false;
+                        bytes += len;
                         // SAFETY: the tile's mapping; only submissions write it.
                         unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), data.add(done), len) };
                     }
@@ -1498,12 +1535,6 @@ fn region_state(address: usize) -> (bool, usize) {
         let end = info.BaseAddress as usize + info.RegionSize;
         (info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS, end)
     }
-}
-
-/// Where the unmapped title memory `address` is in ends, if it is.
-fn unmapped(address: usize) -> Option<usize> {
-    let (gone, end) = region_state(address);
-    gone.then_some(end)
 }
 
 /// Tiles of `[start, end)` known to have no title memory are looked at again.
@@ -2492,9 +2523,13 @@ impl Shadow {
                 Some((at, data, n, old.as_mut_ptr() as usize + at % PAGE))
             })
             .collect();
-        let written = std::sync::atomic::AtomicUsize::new(0);
+        // Phase 1: lock-free parallel diff, title-read, and merge across tiles.
+        // Coalescing `watch::writing` in Phase 2 avoids thousands of contended
+        // `GUARDS` / `JOURNAL` / `VirtualProtect` calls inside worker threads.
+        let pending_writes: Mutex<Vec<(usize, Vec<u8>, usize, usize)>> = Mutex::new(Vec::new());
         crate::host::in_parallel(&work, 8, |chunk| {
-            let mut title: Option<Vec<u8>> = None;
+            let mut local_scratch: Option<Vec<u8>> = None;
+            let mut local_dirty: Vec<(usize, Vec<u8>, usize, usize)> = Vec::new();
             for &(at, data, n, old) in chunk {
                 // SAFETY: the tile's mapping and its snapshot (kept under the
                 // lock held above); this slice is this thread's alone.
@@ -2507,30 +2542,65 @@ impl Shadow {
                 }
                 #[cfg(feature = "diagnostics")]
                 SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
-                let buf = title.get_or_insert_with(|| {
-                    let mut v = pooled(PAGE);
-                    v.resize(PAGE, 0);
-                    v
-                });
+                let mut buf = local_scratch.take().unwrap_or_else(|| pooled(PAGE));
+                if buf.len() < PAGE {
+                    buf.resize(PAGE, 0);
+                }
                 if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
+                    local_scratch = Some(buf);
                     continue;
                 }
-                if let Some((dirty_start, dirty_end)) = merge_gpu_writes_mut(&mut buf[..n], host, old) {
-                    let dirty_len = dirty_end - dirty_start;
-                    crate::watch::writing(at + dirty_start, dirty_len);
-                    crate::host::write_mapped(
-                        (at + dirty_start) as *mut u8,
-                        buf[dirty_start..].as_ptr(),
-                        dirty_len,
-                    );
-                    written.fetch_add(dirty_len, Ordering::Relaxed);
+                if let Some((dirty_start, dirty_end)) = merge_gpu_writes_mut(&mut buf[..n], host, old)
+                {
+                    local_dirty.push((at + dirty_start, buf, dirty_start, dirty_end));
+                } else {
+                    local_scratch = Some(buf);
                 }
             }
-            if let Some(buf) = title {
+            if let Some(buf) = local_scratch {
                 give_back(buf);
             }
+            if !local_dirty.is_empty() {
+                pending_writes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(local_dirty);
+            }
         });
-        let written = written.into_inner();
+        let mut dirty_writes = pending_writes.into_inner().unwrap_or_else(|e| e.into_inner());
+        let mut written = 0usize;
+        if !dirty_writes.is_empty() {
+            dirty_writes.sort_unstable_by_key(|w| w.0);
+            // Coalesce contiguous/overlapping title spans up to 64 KiB block boundaries
+            // so `watch::writing` opens and pins each span once instead of per-tile.
+            let mut span: Option<(usize, usize)> = None;
+            for &(addr, _, dirty_start, dirty_end) in &dirty_writes {
+                let end = addr + (dirty_end - dirty_start);
+                match &mut span {
+                    Some((s, e)) if addr <= e.saturating_add(PAGE) => {
+                        *e = (*e).max(end);
+                    }
+                    Some((s, e)) => {
+                        crate::watch::writing(*s, *e - *s);
+                        span = Some((addr, end));
+                    }
+                    None => span = Some((addr, end)),
+                }
+            }
+            if let Some((s, e)) = span {
+                crate::watch::writing(s, e - s);
+            }
+            for (addr, buf, dirty_start, dirty_end) in dirty_writes {
+                let dirty_len = dirty_end - dirty_start;
+                crate::host::write_mapped(
+                    addr as *mut u8,
+                    buf[dirty_start..].as_ptr(),
+                    dirty_len,
+                );
+                written += dirty_len;
+                give_back(buf);
+            }
+        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| !ranges.iter().any(|&(a, l)| r == (a, a.saturating_add(l))));
         if pending.is_empty() {
