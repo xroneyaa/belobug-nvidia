@@ -20,9 +20,9 @@ intact.
 | Area | Current state |
 |------|---------------|
 | Target adapters | NVIDIA RTX 3060 Ti 8 GB (Wave32 `32-32`, capped descriptor heap fallback); prior base also ran on AMD RX 9070 XT 16 GB (Wave64) |
-| Shader translation (Wave32 `32-32`) | **25,491 / 25,889** programs emit DXIL across 26,503 containers in the shader archive (614 duplicates skipped; 398 unsupported, see below) |
-| Live in-game status (RTX 3060 Ti, prior runs) | Menus reached `29.9–30.8 fps` (`shadow::sweep` stalls eliminated); world scenes ran `0.2–1.0 fps` before hitting a Windows commit `Os { code: 1455 }` thread-spawn crash (`5.1 GiB` textures + `2.3 GiB` sparse tile heaps, `1.5–2.8 s` `bindless_plan` / sparse copy loops) |
-| Live in-game status (after 2026-11-26 Stage 2b commit/FPS pass) | **Ready for live re-test** (`victory-gpu`: `140 passed; 0 failed; 4 ignored`) |
+| Shader translation (Wave32 `32-32`) | **25,599 / 25,889** programs emit DXIL across 26,503 containers in the shader archive (614 duplicates skipped; 290 unsupported, `14,246 / 14,247` VP) |
+| Live in-game status (RTX 3060 Ti, prior runs) | Menus reached `29.9–30.8 fps` (`shadow::sweep` stalls eliminated); world runs reached `1+ fps`, with a deferred-lighting resolve shader dropped and stale `R9G9B9E5_SHAREDEXP` syncs causing yellow/black-sphere frames |
+| Live in-game status (after 2026-11-26 Stage 3 lighting & shader pass) | **Ready for live re-test** (`victory-gpu`: `141 passed; 0 failed; 4 ignored`) |
 | Ray tracing (`VICTORY_RAYS`) | Disabled by default; BVH builder/wind compute passes stay skipped unless opted in |
 
 ### What this fork changes
@@ -36,11 +36,13 @@ intact.
   proves when a `WaveActiveBitOr` only drives a loop over each lane's own
   set bits and allows a 32-lane wave OR to stand in for 64 lanes
   (`VICTORY_WAVE_OWN_BITS=0` disables this).
-- **Pre-SSA user-data unspilling & structured lane masks (`ir.rs`, `unspill.rs`, `sgpr_spill.rs`, `structure.rs`)**:
+- **Pre-SSA user-data unspilling, paired mask-saves & structured lane masks (`ir.rs`, `unspill.rs`, `sgpr_spill.rs`, `structure.rs`)**:
   user-data spill-table loads are unspilled in production builds on both
   Wave32 and Wave64, `would_unspill` gates un-unspilled BVH stages when
-  `VICTORY_RAYS` is off, and `structure.rs` tracks incoming edge masks for phi
-  joins (`phi_masks`).
+  `VICTORY_RAYS` is off, `ir::unspill` scans forward within basic blocks so
+  separated `v_writelane_b32` mask-save halves pair into `s_mov_b64` (fixing
+  `108` additional Wave32 shaders including deferred lighting resolve), and
+  `structure.rs` tracks incoming edge masks for phi joins (`phi_masks`).
 - **Capped descriptor heap handling (`victory-gpu`, commits `9941b5e`, `0390c9e`)**:
   probes padded view heaps at startup and clamps view indices to the null slot
   on capped heaps (`2^18` dynamic slots), instead of failing shader translation
@@ -59,8 +61,11 @@ intact.
 - **`R9G9B9E5_SHAREDEXP` copy-bridge & bounded bindless plans (`descriptor/host.rs`, `draw.rs`, `host.rs`)**:
   uses a D3D12 buffer-bridge copy fallback for `R9G9B9E5_SHAREDEXP` (DXGI
   format `42`) via shared `HostHeap::placed_raw_texture` across both bindless
-  (`resolve_placed`) and root-table (`use_slot`) descriptor paths; flushes
-  dirty shared-exponent copies at the end of `HostContext::bind`; keys
+  (`resolve_placed`) and root-table (`use_slot`) descriptor paths; skips
+  currently bound RTVs and unordered UAVs during `HostContext::bind` pre-work
+  flushes (`flush_dirty_shared_exponents_excluding`) and marks written RTVs
+  plus active unordered `R9G9B9E5_SHAREDEXP` targets dirty after GPU work
+  (`note_shared_post_work`); keys
   `Bindless::budget` to each presented frame (`presented() + 1`) so slow
   frames do not refill the plan budget mid-frame; checks elapsed time per slot
   and caps exhausted-budget urgent overflow (`URGENT_OVERFLOW_FRAME_US = 4_000`
@@ -118,12 +123,13 @@ intact.
 
 ### Verified builds & tests (2026-11-26)
 
-All checks below ran with `--locked` on Windows 11 + RTX 3060 Ti (`host waves 32-32`):
+All checks below ran after the latest code edits with `--locked` on Windows 11 + RTX 3060 Ti (`host waves 32-32`):
 
 - `cargo check --workspace --all-targets --locked`: **passed**
 - `cargo build --release --locked` and `cargo build --profile diag -p victory --features diagnostics --locked`: **passed**
-- `victory-gpu` (`-- --test-threads=1`, run after the latest edits): **`140 passed; 0 failed; 4 ignored`**
-- Other unchanged passing crates (last run prior to the `victory-gpu` CPU/FPS pass):
+- `victory-gpu` (`-- --test-threads=1`): **`141 passed; 0 failed; 4 ignored`** (including `shared_exponent_post_work_and_excluding_keep_sync_accurate`)
+- `victory-shader` (`-- --test-threads=1`): **`279 passed; 4 failed; 6 ignored`** (same 4 pre-existing Wave32 `emit::valu_tests` failures listed below; `ir::tests::spilled_lanes_become_scalars` covering separated save-pairs passed)
+- Other workspace crates:
   `victory` (`1 passed`), `victory-core` (`11 passed`), `victory-formats`
   (`24 passed; 4 ignored`), `victory-game` (`2 passed`), `victory-pe`
   (`7 passed`), `victory-pipeline` (`4 passed`), `victory-loader`
@@ -133,14 +139,14 @@ All checks below ran with `--locked` on Windows 11 + RTX 3060 Ti (`host waves 32
 
 ### Known problems
 
-- **Unverified in-game after the latest CPU/FPS pass**: live playback of the
-  title has not yet been re-tested with these CPU/FPS optimizations, and
-  overexposed/neon world lighting halos seen in the prior run remain to be
-  investigated once live frame rate reaches `1–3+ fps`.
-- **Wave32 unsupported console shaders**: across the title's shader archive,
-  `398` of `25,889` programs still fail to translate (`195` non-VS/PS/CS/MS stages, `71` mesh
-  shaders exceeding 32 KiB, `14` console wave64 lane ops, `8` LDS without
-  barriers, and `opaque lane mask` / `conditional export` cases).
+- **Unverified in-game after the 2026-11-26 Stage 3 lighting & shader pass**:
+  live playback has not yet been re-tested with the `ir::unspill` paired
+  mask-save fix and post-draw/dispatch `R9G9B9E5_SHAREDEXP` sync fix.
+- **Wave32 unsupported console shaders**: across the shader archive,
+  `290` of `25,889` tracked programs still fail to emit DXIL (`195`
+  untracked-SGPR-address stages, `71` mesh shaders exceeding 32 KiB, `14`
+  console wave64 lane ops, `9` wave64 LDS-sharing shaders without barriers,
+  and `1` `opaque lane mask` case).
 - **Pre-existing failing tests (4 + 5 + 1)**:
   - `victory-shader` (`279 passed; 4 failed; 6 ignored`): 4 pre-existing Wave32
     `emit::valu_tests` failures (`loop_exit_mask_counted_after_the_loop`,

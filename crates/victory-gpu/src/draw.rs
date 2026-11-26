@@ -113,6 +113,8 @@ pub(crate) struct State {
     /// Whether the last [`State::bind`] left a used unordered access view
     /// with nothing behind it (a null view).
     null_uav: bool,
+    /// Resources currently bound for unordered writes in [`State::bind`].
+    write_r32: Vec<usize>,
 }
 
 impl Drop for State {
@@ -724,8 +726,19 @@ impl State {
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
+    fn pipeline_writes_memory(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This)
+            .is_some_and(|p| p.stages.iter().any(|s| s.translated().writes_memory))
+    }
+
+    fn post_work(&self, list: &HostList, graphics: bool) {
+        let targets = if graphics { &self.targets[..] } else { &[] };
+        list.note_shared_post_work(targets, self.pipeline_writes_memory());
+    }
+
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         self.null_uav = false;
+        self.write_r32.clear();
         let l = &list.list;
         let by_address = p.stages.iter().any(|s| {
             s.translated()
@@ -892,7 +905,13 @@ impl State {
                 }
             }
         }
-        list.flush_dirty_shared_exponents();
+        if compute {
+            list.flush_dirty_shared_exponents_excluding(&self.write_r32);
+        } else {
+            let mut skip = self.targets.clone();
+            skip.extend_from_slice(&self.write_r32);
+            list.flush_dirty_shared_exponents_excluding(&skip);
+        }
         true
     }
 
@@ -983,6 +1002,7 @@ impl State {
         list.count_write();
         list.count_work();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        list.note_shared_post_work(&[], p.stages.iter().any(|s| s.translated().writes_memory));
         // Depth textures it wrote as images get what it wrote; then the
         // title's state goes back on the list.
         let lit = self.ambient(list, p);
@@ -1120,6 +1140,7 @@ impl State {
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     list.count_work();
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    self.post_work(list, true);
                     true
                 }
                 Err(_) => false,
@@ -1152,7 +1173,7 @@ impl State {
             return;
         };
         match host.mirror(index, handle, true) {
-            Some(view) => readable(list, u, &view),
+            Some(view) => readable(list, u, &view, &mut self.write_r32),
             None => self.null_uav |= u.kind == ResourceType::Uav,
         }
     }
@@ -1264,7 +1285,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     match crate::descriptor::view(handle) {
-                        Some(view) => readable(list, u, &view),
+                        Some(view) => readable(list, u, &view, &mut self.write_r32),
                         None => self.null_uav |= u.kind == ResourceType::Uav,
                     }
                 }
@@ -1286,7 +1307,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     match crate::descriptor::view(handle) {
-                        Some(view) => readable(list, u, &view),
+                        Some(view) => readable(list, u, &view, &mut self.write_r32),
                         None => self.null_uav |= u.kind == ResourceType::Uav,
                     }
                 }
@@ -1330,7 +1351,7 @@ impl State {
                     Some(view) => {
                         host.make_at(index, &view);
                         if let Some(u) = used {
-                            readable(list, u, &view);
+                            readable(list, u, &view, &mut self.write_r32);
                         }
                     }
                     None => {
@@ -1445,6 +1466,7 @@ impl State {
             };
             list.count_work();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            self.post_work(list, true);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1542,6 +1564,7 @@ impl State {
             };
             list.count_work();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            self.post_work(list, true);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1849,12 +1872,14 @@ impl State {
             list.count_write();
             list.count_work();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            self.post_work(list, false);
             if crate::twin::resolve(list) {
                 self.continue_in(list);
             }
         } else {
             list.count_work();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            self.post_work(list, true);
         }
         true
     }
@@ -1912,7 +1937,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
-fn readable(list: &HostList, u: &UsedResource, view: &View) {
+fn readable(list: &HostList, u: &UsedResource, view: &View, write_r32: &mut Vec<usize>) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -1958,6 +1983,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
                 return;
             }
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            write_r32.push(*resource);
         }
         _ => {}
     }

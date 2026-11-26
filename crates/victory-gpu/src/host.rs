@@ -674,11 +674,13 @@ pub(crate) struct HostList {
     /// resource first.
     states: Mutex<States>,
     /// R32 textures copied to their shared-exponent read view since the last
-    /// write transition in this recording. Cleared on reset and on writes.
+    /// write transition or GPU write in this recording.
     shared_synced: Mutex<std::collections::HashSet<usize>>,
     /// R32 render/UAV targets written during this recording, to sync either
     /// at the next barrier/bindless read or at submission via `shared_dirty`.
     r32_dirty: Mutex<std::collections::HashMap<usize, std::sync::Arc<crate::resource::HostTexture>>>,
+    /// R32 targets currently in `UNORDERED_ACCESS` (`0x8`) on this list.
+    r32_uav: Mutex<std::collections::HashMap<usize, std::sync::Arc<crate::resource::HostTexture>>>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// What the title's list held for this recording, if the title reset or
@@ -1102,6 +1104,7 @@ impl Host {
                 allocator,
                 shared_synced: Mutex::default(),
                 r32_dirty: Mutex::default(),
+                r32_uav: Mutex::default(),
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
                 list,
                 deferred: Mutex::default(),
@@ -2041,6 +2044,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.shared_synced.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.r32_dirty.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.r32_uav.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.queries.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -2073,12 +2077,22 @@ impl HostList {
         let copy = crate::resource::host_copy(resource)?;
         let wanted = legal_state(texture, wanted);
         let key = std::sync::Arc::as_ptr(&copy) as usize;
-        if copy.r32_target && wanted & (0x4 | 0x8 | 0x400 | 0x1000) != 0 {
-            self.shared_synced.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
-            self.r32_dirty
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key, copy.clone());
+        if copy.r32_target {
+            {
+                let mut uavs = self.r32_uav.lock().unwrap_or_else(|e| e.into_inner());
+                if wanted == 0x8 {
+                    uavs.insert(key, copy.clone());
+                } else {
+                    uavs.remove(&key);
+                }
+            }
+            if wanted & (0x4 | 0x8 | 0x400 | 0x1000) != 0 {
+                self.shared_synced.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+                self.r32_dirty
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, copy.clone());
+            }
         }
         self.transition_copy(copy, wanted).map(|before| (texture, before))
     }
@@ -2098,9 +2112,53 @@ impl HostList {
             .insert(key, copy);
     }
 
+    /// Re-marks active RTVs (`targets`) and active `0x8` `r32_target` UAVs dirty
+    /// after a draw/dispatch executes on the GPU.
+    pub(crate) fn note_shared_post_work(&self, targets: &[usize], uavs: bool) {
+        for &t in targets {
+            self.note_shared_write(t as crate::object::This);
+        }
+        if !uavs {
+            return;
+        }
+        let entries: Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)> = {
+            let active = self.r32_uav.lock().unwrap_or_else(|e| e.into_inner());
+            if active.is_empty() {
+                return;
+            }
+            active.iter().map(|(&k, c)| (k, c.clone())).collect()
+        };
+        {
+            let mut synced = self.shared_synced.lock().unwrap_or_else(|e| e.into_inner());
+            for &(key, _) in &entries {
+                synced.remove(&key);
+            }
+        }
+        let mut dirty = self.r32_dirty.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, copy) in entries {
+            dirty.insert(key, copy);
+        }
+    }
+
     /// Refreshes every R32 target written in this recording that already has an
     /// initialized shared-exponent shadow copy (used at enhanced barriers and bindless draws).
     pub(crate) fn flush_dirty_shared_exponents(&self) {
+        self.flush_dirty_shared_exponents_excluding(&[]);
+    }
+
+    /// Like [`Self::flush_dirty_shared_exponents`], skipping resources that the
+    /// upcoming command is bound to write (`skip_resources`).
+    pub(crate) fn flush_dirty_shared_exponents_excluding(&self, skip_resources: &[usize]) {
+        if self.r32_dirty.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            return;
+        }
+        let skip_keys: Vec<usize> = skip_resources
+            .iter()
+            .filter_map(|&r| {
+                crate::resource::host_copy(r as crate::object::This)
+                    .map(|c| std::sync::Arc::as_ptr(&c) as usize)
+            })
+            .collect();
         let ready: Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)> = {
             let mut dirty = self.r32_dirty.lock().unwrap_or_else(|e| e.into_inner());
             if dirty.is_empty() {
@@ -2108,7 +2166,10 @@ impl HostList {
             }
             let keys: Vec<usize> = dirty
                 .iter()
-                .filter(|(_, c)| c.shared_copy.get().and_then(Option::as_ref).is_some())
+                .filter(|&(&k, c)| {
+                    !skip_keys.contains(&k)
+                        && c.shared_copy.get().and_then(Option::as_ref).is_some()
+                })
                 .map(|(&k, _)| k)
                 .collect();
             keys.into_iter()
@@ -2143,6 +2204,18 @@ impl HostList {
         if self.shared_synced.lock().unwrap_or_else(|e| e.into_inner()).insert(key) {
             self.copy_shared_exponent(&source, shared, restore_state);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_sync_flags(&self, resource: crate::object::This) -> (bool, bool, bool) {
+        let Some(source) = crate::resource::host_copy(resource) else {
+            return (false, false, false);
+        };
+        let key = std::sync::Arc::as_ptr(&source) as usize;
+        let uav = self.r32_uav.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&key);
+        let dirty = self.r32_dirty.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&key);
+        let synced = self.shared_synced.lock().unwrap_or_else(|e| e.into_inner()).contains(&key);
+        (uav, dirty, synced)
     }
 
     /// Tracks a host-owned copy just like a title texture, including its

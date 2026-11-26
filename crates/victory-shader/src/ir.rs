@@ -533,11 +533,20 @@ fn unspill(
     let partner = |i: usize| -> Option<usize> {
         let (save, reg, code, lane) = parks[i]?;
         if save {
-            let j = i + 1;
-            (j < list.len()
-                && !leader(j)
-                && parks[j] == Some((true, reg, code + 1, lane + 1)))
-            .then_some(j)
+            let mut j = i + 1;
+            while j < list.len() && !leader(j) {
+                if parks[j] == Some((true, reg, code + 1, lane + 1)) {
+                    return Some(j);
+                }
+                if parks[j].is_some_and(|p| p.1 == reg && (p.3 == lane || p.3 == lane + 1))
+                    || written[j].contains(&code)
+                    || written[j].contains(&(code + 1))
+                {
+                    return None;
+                }
+                j += 1;
+            }
+            None
         } else {
             // The second restore may come a few instructions later (the
             // compiler schedules other work between the two): the pair is
@@ -1696,6 +1705,26 @@ mod tests {
         assert_eq!(pi[0].name(), "s_mov_b64");
         assert_eq!(pi[1].name(), "s_mov_b64");
         assert_eq!(pi[2].name(), "s_mov_b32");
+        // Separated `v_writelane_b32` save halves pair into `s_mov_b64` too.
+        let separated_save = build_words(
+            &[
+                0xD761_0005,
+                0x0001_0604, // v_writelane_b32 v5, s4, 3
+                0xBE88_0381, // s_mov_b32 s8, 1
+                0xD761_0005,
+                0x0001_0805, // v_writelane_b32 v5, s5, 4
+                0xD760_0006,
+                0x0001_0705, // v_readlane_b32 s6, v5, 3
+                0xD760_0007,
+                0x0001_0905, // v_readlane_b32 s7, v5, 4
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let si = &separated_save.blocks[0].insts;
+        assert_eq!(si[0].name(), "s_mov_b32");
+        assert_eq!(si[1].name(), "s_mov_b64");
+        assert_eq!(si[2].name(), "s_mov_b64");
         code.insert(6, 0x7E00_0305); // v_mov_b32 v0, v5
         let p = build_words(&code, false);
         assert_eq!(p.blocks[0].insts[0].name(), "v_writelane_b32");

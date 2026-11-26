@@ -3144,6 +3144,79 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
     }
 
+    /// Pre-work flushes skip resources about to be written, while post-work
+    /// notifications re-dirty written RTVs and active unordered R32 targets.
+    #[test]
+    fn shared_exponent_post_work_and_excluding_keep_sync_accurate() {
+        let Some(host) = host() else { return };
+        let _ = host.log_messages();
+        let words: [u32; 14] = [3, 0, 0, 0, 16, 0, 16, 0x0001_0001, 42, 1, 0, 0, 4, 0];
+        let mut resource = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_at_address(
+                std::ptr::null(),
+                0x10000,
+                words.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &RESOURCE_IID,
+                &mut resource,
+            ),
+            S_OK
+        );
+        // SAFETY: plain CPU-only descriptor heap creation.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let view = View::Shader(resource as usize, Some([67, 4, 5768, 0, 0, 1, 0, 0, 0, 0]));
+        // SAFETY: plain query on live heap.
+        let at = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        assert!(make(&view, at).unwrap().is_some());
+
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, resource, 8);
+        assert_eq!(list.shared_sync_flags(resource), (true, true, false));
+
+        list.flush_dirty_shared_exponents_excluding(&[resource as usize]);
+        assert_eq!(list.shared_sync_flags(resource), (true, true, false));
+
+        list.flush_dirty_shared_exponents();
+        assert_eq!(list.shared_sync_flags(resource), (true, false, true));
+
+        // Active UAV is re-dirtied after a memory-writing dispatch/draw.
+        list.note_shared_post_work(&[], true);
+        assert_eq!(list.shared_sync_flags(resource), (true, true, false));
+
+        list.flush_dirty_shared_exponents();
+        assert_eq!(list.shared_sync_flags(resource), (true, false, true));
+
+        // Transition to RTV (4), skip while bound as target, then mark dirty post-draw
+        // so the subsequent SRV read refresh (`prepare_shared_exponent`) runs again.
+        crate::list::ensure_state(&list, resource, 4);
+        list.note_shared_post_work(&[resource as usize], false);
+        assert_eq!(list.shared_sync_flags(resource), (false, true, false));
+
+        list.flush_dirty_shared_exponents_excluding(&[resource as usize]);
+        assert_eq!(list.shared_sync_flags(resource), (false, true, false));
+
+        crate::list::ensure_state(&list, resource, 0xc0);
+        assert!(list.shared_sync_flags(resource).2);
+
+        list.close();
+        host.execute(&[&list]);
+        let msgs = host.log_messages();
+        assert!(msgs.is_none(), "unexpected D3D12 validation errors: {msgs:?}");
+        // SAFETY: plain removal-reason query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "{msgs:?}");
+        slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
+    }
+
     #[repr(C)]
     struct ExtendedHeapDesc {
         desc: HeapDesc,
